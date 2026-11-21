@@ -21,18 +21,29 @@ use tidelm_model::Checkpoint;
 
 use crate::config::GlmConfig;
 use crate::lin::{self, Bf16Mat, Lin};
-use crate::weights::{Attn, DsaW, Embed, HcW, KdaW, Layer, Loader, Mlp, MtpExtra, Weights};
+use crate::weights::{bf16_from_f32, Attn, Cut, DsaW, Embed, HcW, KdaW, Layer, Loader, Mlp, MtpExtra, Weights,
+                    SPLIT_DOWN, SPLIT_EH, SPLIT_HEAD, SPLIT_O, SPLIT_UP};
 use crate::{ck, Result};
 
 const P: &str = "model.language_model.";
 
-/// GLM_FLASH_DENSE: the non-expert weights' format (fp8, the default, or bf16). It moves values: in
-/// the boot guard.
-pub fn dense_fp8() -> Result<bool> {
+/// GLM_FLASH_DENSE: the non-expert weights' format. `fp8` (the default) and `bf16` read a
+/// checkpoint's BF16 tensors and (fp8) quantise them at load; `exl3` reads a checkpoint whose
+/// non-expert matrices are EXL3 themselves (`.trellis` / `.suh` / `.svh` / `.mul1`) and widens
+/// the few tensors such a checkpoint leaves in F16 / BF16. It moves values: in the boot guard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DenseFormat {
+    Fp8,
+    Bf16,
+    Exl3,
+}
+
+pub fn dense_format() -> Result<DenseFormat> {
     match std::env::var("GLM_FLASH_DENSE").as_deref() {
-        Err(_) | Ok("") | Ok("fp8") => Ok(true),
-        Ok("bf16") => Ok(false),
-        Ok(v) => Err(format!("GLM_FLASH_DENSE={v}: fp8 or bf16").into()),
+        Err(_) | Ok("") | Ok("fp8") => Ok(DenseFormat::Fp8),
+        Ok("bf16") => Ok(DenseFormat::Bf16),
+        Ok("exl3") => Ok(DenseFormat::Exl3),
+        Ok(v) => Err(format!("GLM_FLASH_DENSE={v}: fp8, bf16 or exl3").into()),
     }
 }
 
@@ -83,10 +94,55 @@ fn u16s(b: &[u8]) -> Vec<u16> {
 
 struct Ld<'a> {
     ld: Loader<'a>,
-    fp8: bool,
+    format: DenseFormat,
 }
 
 impl Ld<'_> {
+    fn fp8(&self) -> bool {
+        self.format == DenseFormat::Fp8
+    }
+
+    fn exl3(&self) -> bool {
+        self.format == DenseFormat::Exl3
+    }
+
+    /// A tensor that an EXL3 checkpoint leaves unquantised is F16 or BF16; both widen to BF16 here.
+    /// The shape as [rows, the rest].
+    fn dims_any(&self, name: &str) -> Result<(usize, usize)> {
+        let m = self.ld.ck.meta(name).map_err(|e| format!("{name}: {e}"))?;
+        if m.dtype != "BF16" && m.dtype != "F16" {
+            return Err(format!("{name}: {} (BF16 or F16 expected)", m.dtype).into());
+        }
+        Ok((m.shape[0], m.shape[1..].iter().product()))
+    }
+
+    /// Rows `r` of an F16 / BF16 tensor [n][k], widened to BF16 when it is F16.
+    fn rows_any(&self, name: &str, r: Range<usize>) -> Result<(Vec<u16>, usize)> {
+        let (n, k) = self.dims_any(name)?;
+        if r.end > n {
+            return Err(format!("{name}: rows {r:?} of {n}").into());
+        }
+        let f = self.ld.f32s(name)?;
+        let mut o = Vec::with_capacity((r.end - r.start) * k);
+        o.extend(f[r.start * k..r.end * k].iter().map(|&x| bf16_from_f32(x)));
+        Ok((o, k))
+    }
+
+    /// The whole F16 / BF16 tensor, widened to BF16 when it is F16.
+    fn all_any(&self, name: &str) -> Result<(Vec<u16>, usize, usize)> {
+        let (n, k) = self.dims_any(name)?;
+        Ok((self.rows_any(name, 0..n)?.0, n, k))
+    }
+
+    /// A fused matrix's []: EXL3 when the checkpoint quantises it that way, else the BF16 / FP8 path.
+    fn matrix(&self, exl3_prefixes: &[&str], split: usize, cut: Cut, fused: &[(String, Option<Range<usize>>)]) -> Result<Lin> {
+        if self.exl3() {
+            Ok(Lin::Exl3(self.ld.exl3(exl3_prefixes, split, cut, None)?))
+        } else {
+            self.fused(fused, split)
+        }
+    }
+
     /// A BF16 tensor's shape as [rows, the rest].
     fn dims(&self, name: &str) -> Result<(usize, usize)> {
         let m = self.ld.ck.meta(name).map_err(|e| format!("{name}: {e}"))?;
@@ -141,7 +197,7 @@ impl Ld<'_> {
     }
 
     fn lin(&self, w: Vec<u16>, n: usize, k: usize, split: usize) -> Result<Lin> {
-        if self.fp8 {
+        if self.fp8() {
             Ok(Lin::Fp8(lin::fp8_from_bf16(self.ld.st, &w, n, k, split)?))
         } else {
             Ok(Lin::Bf16(Bf16Mat { w: DeviceBuffer::from_slice(&w)?, n, k, split }))
@@ -188,8 +244,8 @@ impl Ld<'_> {
 
 pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize, st: &Stream, log: &dyn Fn(&str)) -> Result<Weights> {
     let ckpt = Checkpoint::open(model_dir)?;
-    let fp8 = dense_fp8()?;
-    let d = Ld { ld: Loader { ck: &ckpt, rank, world, st }, fp8 };
+    let format = dense_format()?;
+    let d = Ld { ld: Loader { ck: &ckpt, rank, world, st }, format };
     let (h, r) = (cfg.hidden, rank);
     let hl = cfg.heads / world;
     let kda = cfg.kda.ok_or("GLM-5.3-Flash without KDA")?;
@@ -201,11 +257,11 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
     let hcut = |n: usize| Some(r * n..(r + 1) * n);
     let t0 = std::time::Instant::now();
     let embed = Embed::Bf16(d.bf16_dev(&format!("{P}embed_tokens.weight"))?);
-    let head = d.fused(&[("lm_head.weight".into(), hcut(vl))], 1)?;
+    let head = d.matrix(&["lm_head"], SPLIT_HEAD, Cut::N, &[("lm_head.weight".into(), hcut(vl))])?;
     let norm = d.bf16_dev(&format!("{P}norm.weight"))?;
     let mut bytes = 2 * cfg.vocab * h + head.bytes();
     // one box, MTP: the draft passes' head over the listed ids
-    let draft = match draft_ids(cfg.vocab)?.filter(|_| world == 1 && cfg.mtp) {
+    let draft = match draft_ids(cfg.vocab)?.filter(|_| world == 1 && cfg.mtp && !d.exl3()) {
         Some(ids) => {
             let (w, k) = d.gather("lm_head.weight", &ids)?;
             let head = d.lin(w, ids.len(), k, 1)?;
@@ -225,17 +281,28 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
         let mtp = cfg.mtp && l == cfg.mtp_layer();
         let attn = match cfg.attn[l] {
             crate::config::AttnKind::Kda => {
-                let conv = {
-                    let mut c = vec![];
-                    for x in ["q", "k", "v"] {
-                        c.extend(d.rows(&format!("{a}{x}_conv1d.weight"), r * dl..(r + 1) * dl)?.0);
+                let conv = match d.dims_any(&format!("{a}conv1d.weight")) {
+                    Ok(_) => DeviceBuffer::from_slice(&d.rows_any(&format!("{a}conv1d.weight"), r * 3 * dl..(r + 1) * 3 * dl)?.0)?,
+                    Err(_) => {
+                        let mut c = vec![];
+                        for x in ["q", "k", "v"] {
+                            c.extend(d.rows_any(&format!("{a}{x}_conv1d.weight"), r * dl..(r + 1) * dl)?.0);
+                        }
+                        DeviceBuffer::from_slice(&c)?
                     }
-                    DeviceBuffer::from_slice(&c)?
                 };
-                let o = {
+                let o = if d.exl3() {
+                    Lin::Exl3(d.ld.exl3(&[&format!("{a}o_proj")], 1, Cut::K, None)?)
+                } else {
                     let (w, n) = d.cols(&format!("{a}o_proj.weight"), r * dl..(r + 1) * dl)?;
                     d.lin(w, n, dl, 1)?
                 };
+                if d.exl3() {
+                    // the fused proj is one EXL3 qkv_proj (q|k|v, 3 dl rows) plus F16 f_a|g_a|b rows:
+                    // two matrices over one output buffer, which needs the epilogue's output stride
+                    // (RowStack). Not built yet, so refuse rather than serve a wrong layout.
+                    return Err(format!("{a}proj: GLM_FLASH_DENSE=exl3 needs the split qkv_proj form (not built)").into());
+                }
                 Attn::Kda(KdaW {
                     proj: d.fused(&[(format!("{a}q_proj.weight"), hcut(dl)), (format!("{a}k_proj.weight"), hcut(dl)),
                                     (format!("{a}v_proj.weight"), hcut(dl)), (format!("{a}f_a_proj.weight"), None),
@@ -252,7 +319,7 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
             crate::config::AttnKind::Dsa => {
                 let i = format!("{a}indexer.");
                 let rows = cfg.kvb_rows();
-                let (kvb, k) = d.rows(&format!("{a}kv_b_proj.weight"), r * hl * rows..(r + 1) * hl * rows)?;
+                let (kvb, k) = d.rows_any(&format!("{a}kv_b_proj.weight"), r * hl * rows..(r + 1) * hl * rows)?;
                 if k != cfg.kv_lora {
                     return Err(format!("{a}kv_b_proj: K {k}").into());
                 }
@@ -263,10 +330,17 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
                 st.synchronize()?;
                 drop(stage);
                 let vd = cfg.v_dim;
-                let o = {
+                let o = if d.exl3() {
+                    Lin::Exl3(d.ld.exl3(&[&format!("{a}o_proj")], 4, Cut::K, None)?)
+                } else {
                     let (w, n) = d.cols(&format!("{a}o_proj.weight"), r * hl * vd..(r + 1) * hl * vd)?;
                     d.lin(w, n, hl * vd, 4)?
                 };
+                if d.exl3() {
+                    // q_a | kv_a are EXL3 and wk | weights_proj | gate are F16: two/three matrices over
+                    // one output buffer, which needs the epilogue's output stride (RowStack). Not built.
+                    return Err(format!("{a}proj_a: GLM_FLASH_DENSE=exl3 needs the split form (not built)").into());
+                }
                 Attn::Dsa(DsaW {
                     proj_a: d.fused(&[(format!("{a}q_a_proj.weight"), None), (format!("{a}kv_a_proj_with_mqa.weight"), None),
                                       (format!("{i}wk.weight"), None), (format!("{i}weights_proj.weight"), None),
@@ -300,12 +374,14 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
         let mlp = if cfg.dense[l] {
             let m = format!("{p}mlp.");
             Mlp::Dense {
-                gate_up: d.fused(&[(format!("{m}gate_proj.weight"), hcut(dil)), (format!("{m}up_proj.weight"), hcut(dil))], 1)?,
-                down: d.fused(&[(format!("{m}down_proj.weight"), hcut(h / world))], 1)?,
+                gate_up: d.matrix(&[&format!("{m}gate_proj"), &format!("{m}up_proj")], SPLIT_UP, Cut::N,
+                                  &[(format!("{m}gate_proj.weight"), hcut(dil)), (format!("{m}up_proj.weight"), hcut(dil))])?,
+                down: d.matrix(&[&format!("{m}down_proj")], SPLIT_DOWN, Cut::N,
+                               &[(format!("{m}down_proj.weight"), hcut(h / world))])?,
             }
         } else {
             let m = format!("{p}mlp.shared_experts.");
-            let (router, n, k) = d.all(&format!("{p}mlp.gate.weight"))?;
+            let (router, n, k) = d.all_any(&format!("{p}mlp.gate.weight"))?;
             if (n, k) != (cfg.experts, h) {
                 return Err(format!("{p}mlp.gate: {n} x {k}").into());
             }
@@ -313,8 +389,10 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
                 router: DeviceBuffer::from_slice(&router)?,
                 router_bf16: true,
                 bias: d.f32_dev(&format!("{p}mlp.gate.e_score_correction_bias"), None)?,
-                sh_gate_up: d.fused(&[(format!("{m}gate_proj.weight"), hcut(il)), (format!("{m}up_proj.weight"), hcut(il))], 1)?,
-                sh_down: d.fused(&[(format!("{m}down_proj.weight"), hcut(h / world))], 1)?,
+                sh_gate_up: d.matrix(&[&format!("{m}gate_proj"), &format!("{m}up_proj")], SPLIT_UP, Cut::N,
+                                     &[(format!("{m}gate_proj.weight"), hcut(il)), (format!("{m}up_proj.weight"), hcut(il))])?,
+                sh_down: d.matrix(&[&format!("{m}down_proj")], SPLIT_DOWN, Cut::N,
+                                  &[(format!("{m}down_proj.weight"), hcut(h / world))])?,
             }
         };
         let mtpx = if mtp {
@@ -322,7 +400,8 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
                 enorm: d.bf16_dev(&format!("{p}enorm.weight"))?,
                 hnorm: d.bf16_dev(&format!("{p}hnorm.weight"))?,
                 sh_norm: d.bf16_dev(&format!("{p}shared_head.norm.weight"))?,
-                eh: d.fused(&[(format!("{p}eh_proj.weight"), hcut(h / world))], 2)?,
+                eh: d.matrix(&[&format!("{p}eh_proj")], SPLIT_EH, Cut::N,
+                             &[(format!("{p}eh_proj.weight"), hcut(h / world))])?,
             })
         } else {
             None
@@ -338,7 +417,7 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
         bytes += layer_bytes(&layer);
         layers.push(layer);
         if l % 9 == 8 {
-            log(&format!("[flash] dense weights ({}): layer {l} ({:.1} GB, {:.0} s)", if fp8 { "fp8" } else { "bf16" },
+            log(&format!("[flash] dense weights ({format:?}): layer {l} ({:.1} GB, {:.0} s)",
                          bytes as f64 / 1e9, t0.elapsed().as_secs_f64()));
         }
     }

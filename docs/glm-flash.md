@@ -542,3 +542,55 @@ the one-box boot from a copy of the served history: prose 22.11, code 26.36 tok/
 token 12.12 s, decode picks missed 3.7-4.5% (prose) and 12.5-14.5% (code)
 (`results/rust-glm53-flash-40-tp1-20261114/`); the pair 36.77 / 46.56 tok/s and 7.58 s
 (`results/rust-glm53-flash-40-tp2-20261114/`).
+
+## A checkpoint that quantises its own non-expert weights (2026-11-21)
+
+`GLM_FLASH_DENSE` now takes `fp8` (the default: read BF16, quantise at load), `bf16` and `exl3`.
+`exl3` reads `.trellis` / `.suh` / `.svh` / `.mul1` matrices for every non-expert tensor instead of
+reading a BF16 checkpoint and quantising it (`flash.rs::dense_format` chooses, `Ld::matrix` loads):
+the checkpoint is served exactly as published, and `tools/glm_fetch_dense.py` and the dense
+directory it fills are gone from the setup.
+
+What moves to EXL3: `lm_head`, both `o_proj` (a `Cut::K` slice of the input columns a rank keeps),
+the dense layers' and the shared experts' `gate|up` (two groups of one shape) and `down`, `eh_proj`,
+`q_b`/`wq_b`, and the router, which such a checkpoint keeps F16. F16/F32 small tensors (norms, the
+mHC coefficients, `kv_b_proj`) are widened on read, so a checkpoint serving this way needs no edit -
+including the codebook, read from `quantization_config.json` when `config.json` names only
+`quant_method`.
+
+The two fused shapes need a `RowStack`: `Loader::exl3` only groups prefixes of the same shape, and
+the EXL3 epilogue writes at a row stride now (`exl3m_dense_out`, 0 = tight). KDA `qkv_proj` mixes
+EXL3 with F16 `f_a|g_a|b`; `q_a`/`kv_a` mix with F16 indexer rows - so each becomes one `RowStack`
+of mixed-format parts, its EXL3 parts single-group and loaded whole (`Cut::None`), which is why the
+fused `qkv_proj` is not cut across TP ranks and TP=2 is not supported in this mode. TP=1 profiles
+only: `configs/glm53-flash-248-exl3.env.example`.
+
+Measured on one DGX Spark, one boot (2026-11-21), the checkpoint
+[vcruz305/GLM-5.3-Flash-SAGE-REXL3-2.48bpw](https://huggingface.co/vcruz305/GLM-5.3-Flash-SAGE-REXL3-2.48bpw)
+(rev `7d0de24`, every routed expert 2.48-bit SAGE, non-expert EXL3):
+
+| one box, the boot | native `GLM_FLASH_DENSE=exl3` |
+|---|---|
+| engine up / device at boot / box | 44 s / 102.34 / 121.6 GiB |
+| MemAvailable left (tools/mem_watch.sh, 300 s, idle + load) | 12.4 GiB |
+| KV pool, 327,680 positions a lane | 2.24 GB a rank |
+
+| one box, bench.py (1024 tokens, temperature 0.6, median of 3) | native | hybrid (`fp8`, dense from a second checkpoint) |
+|---|---:|---:|
+| prose / code, tok/s | 27.11 / 35.04 | 26.09 / 32.75 |
+| prefill 6,830 / 27,290 tokens | 10.0 s (682 tok/s) / 37.5 s (727 tok/s) | 10.57 s / 40.5 s |
+
+The same boot measured the hybrid arm by pointing `GLM_FLASH_DENSE` at a second checkpoint's BF16
+dense weights quantised to FP8 at load. Against the TensorFold server on the same box at 262,144
+positions the native boot leaves 12.4 GiB where it leaves 3.7-3.9 GiB (tools/mem_watch.sh).
+
+Native is +3.9% prose, +7% code, +5% prefill, and frees the 19 GB dense download: the disk cost is
+the pack only (97.4 GB).
+
+The limits, plainly: `GLM_DRAFT_VOCAB` (the listed-vocabulary draft head) is off in this mode,
+because it gathers rows of `lm_head` as BF16 and an EXL3 head cannot be gathered that way; the
+verifier still scores every id, so it costs draft speed, not correctness.
+
+The answers were not scored. The generation gate passed 5/6 outright; the sixth (HTML) wrote a
+complete 895-token page and stopped 5 tokens under the gate's 900-token floor
+(`gate-exl3-native4.json`, the boot above). The floor test catches collapse, not quality.

@@ -96,6 +96,13 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
         want GLM_HEAD exl3 exl3
         want GLM_KVB_FP8 0 1
         want GLM_EMBED_8BIT "" int8
+        # GLM_FLASH_DENSE=fp8|bf16|exl3: the non-expert weights' format. exl3 serves a checkpoint
+        # that quantises its own non-expert weights natively (docs/glm-flash.md); say it here
+        # before the ~100 GB load starts rather than after it (the engine refuses too)
+        case "${GLM_FLASH_DENSE:-fp8}" in
+            fp8|bf16|exl3) ;;
+            *) err "the Rust GLM engine reads GLM_FLASH_DENSE=fp8|bf16|exl3 only (profile: GLM_FLASH_DENSE=$GLM_FLASH_DENSE)" ;;
+        esac
     fi
     want GLM_MISS substitute substitute
     want GLM_PF 0 0
@@ -168,8 +175,9 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     fi
     envs=(NCCL_PROTO=Simple GLM_REASONING_EFFORT="${GLM_REASONING_EFFORT:-medium}"
           GLM_DEFAULT_MAX_TOKENS="${GLM_DEFAULT_MAX_TOKENS:-4096}")
-    # GLM-5.3-Flash's non-expert weights: fp8 (32 x 32 block scales, the default) or bf16 (the
-    # checkpoint's); it moves values, so the boot guard hashes it
+    # GLM-5.3-Flash's non-expert weights: GLM_FLASH_DENSE=fp8 (32 x 32 block scales, the default),
+    # bf16 (the checkpoint's) or exl3 (a checkpoint that quantises its own non-expert weights,
+    # docs/glm-flash.md); it moves values, so the boot guard hashes it
     [[ -n "${GLM_FLASH_DENSE:-}" ]] && envs+=(GLM_FLASH_DENSE="$GLM_FLASH_DENSE")
     # the sampler's defaults when a request names none (unset: generation_config.json's, else 1)
     [[ -n "${GLM_TEMPERATURE:-}" ]] && envs+=(GLM_TEMPERATURE="$GLM_TEMPERATURE")

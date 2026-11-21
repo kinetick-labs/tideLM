@@ -106,12 +106,13 @@ impl Ld<'_> {
         self.format == DenseFormat::Exl3
     }
 
-    /// A tensor that an EXL3 checkpoint leaves unquantised is F16 or BF16; both widen to BF16 here.
+    /// A tensor an EXL3 checkpoint leaves unquantised is F16, BF16 or F32 (the mHC coefficients
+    /// come F32 here, BF16 in the 4 bpw one); all three widen to BF16 on the host.
     /// The shape as [rows, the rest].
     fn dims_any(&self, name: &str) -> Result<(usize, usize)> {
         let m = self.ld.ck.meta(name).map_err(|e| format!("{name}: {e}"))?;
-        if m.dtype != "BF16" && m.dtype != "F16" {
-            return Err(format!("{name}: {} (BF16 or F16 expected)", m.dtype).into());
+        if m.dtype != "BF16" && m.dtype != "F16" && m.dtype != "F32" {
+            return Err(format!("{name}: {} (BF16, F16 or F32 expected)", m.dtype).into());
         }
         Ok((m.shape[0], m.shape[1..].iter().product()))
     }
@@ -143,29 +144,20 @@ impl Ld<'_> {
         }
     }
 
-    /// A BF16 tensor's shape as [rows, the rest].
+    /// A tensor's shape as [rows, the rest]. BF16 is the 4 bpw checkpoint's format; F16 and F32
+    /// are what an EXL3 checkpoint keeps its small tensors in, and every reader widens them.
     fn dims(&self, name: &str) -> Result<(usize, usize)> {
-        let m = self.ld.ck.meta(name).map_err(|e| format!("{name}: {e}"))?;
-        if m.dtype != "BF16" {
-            return Err(format!("{name}: {} (BF16 expected)", m.dtype).into());
-        }
-        Ok((m.shape[0], m.shape[1..].iter().product()))
+        self.dims_any(name)
     }
 
-    /// Rows `r` of a BF16 tensor [n][k] (row-major u16).
+    /// Rows `r` of a tensor [n][k], as BF16.
     fn rows(&self, name: &str, r: Range<usize>) -> Result<(Vec<u16>, usize)> {
-        let (n, k) = self.dims(name)?;
-        if r.end > n {
-            return Err(format!("{name}: rows {r:?} of {n}").into());
-        }
-        let b = self.ld.bytes(name)?;
-        Ok((u16s(&b[r.start * k * 2..r.end * k * 2]), k))
+        self.rows_any(name, r)
     }
 
-    /// The whole tensor.
+    /// The whole tensor, as BF16.
     fn all(&self, name: &str) -> Result<(Vec<u16>, usize, usize)> {
-        let (n, k) = self.dims(name)?;
-        Ok((self.rows(name, 0..n)?.0, n, k))
+        self.all_any(name)
     }
 
     /// Rows `ids` of a BF16 tensor [n][k], in that order.
@@ -235,9 +227,9 @@ impl Ld<'_> {
         Ok(DeviceBuffer::from_slice(&match r { Some(r) => v[r].to_vec(), None => v })?)
     }
 
-    /// Exact BF16 (the mHC mixes and the small things a layer reads whole).
+    /// BF16 (the mHC mixes and the small things a layer reads whole), widened from F16 / F32.
     fn bf16_lin(&self, name: &str, split: usize) -> Result<Lin> {
-        let (w, n, k) = self.all(name)?;
+        let (w, n, k) = self.all_any(name)?;
         Ok(Lin::Bf16(Bf16Mat { w: DeviceBuffer::from_slice(&w)?, n, k, split }))
     }
 }

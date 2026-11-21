@@ -2184,11 +2184,17 @@ impl Act {
         .max()
         .unwrap();
         let max_k = (2 * h).max(cfg.inter).max(cfg.heads / world * 256);
-        let max_kn = [cfg.inter * h / world, 2 * h * h / world, hl * 256 * h, h * cfg.heads / world * 256, cfg.q_lora * 4096]
+        // A stacked part is its own prefill call, so the scratch must hold the widest single one:
+        // a checkpoint that fuses the KDA q|k|v into one matrix asks for 3 dl x h.
+        let max_kn = [cfg.inter * h / world, 2 * h * h / world, hl * 256 * h, h * cfg.heads / world * 256, cfg.q_lora * 4096,
+                      cfg.kda.map(|k| 3 * k.heads * k.dim * h).unwrap_or(0)]
             .into_iter()
             .max()
             .unwrap();
-        let max_zn = (r * (hl * 256).max(4096).max(h)).max(8 * d * 2 * 6144);
+        // z holds a prefill part's [rows][n] fp32 output: the widest single part is a checkpoint's
+        // fused KDA q|k|v, 3 dl columns (a chunk is up to `r` rows).
+        let wide = cfg.kda.map(|k| 3 * k.heads * k.dim).unwrap_or(0);
+        let max_zn = (r * (hl * 256).max(4096).max(h).max(wide)).max(8 * d * 2 * 6144);
         Ok(Act {
             tok: DeviceBuffer::zeroed(r)?,
             lanes: DeviceBuffer::zeroed(2 * MAX_LANES * 4)?,

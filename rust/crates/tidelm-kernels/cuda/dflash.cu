@@ -382,3 +382,95 @@ extern "C" __global__ void glm_df_gsum(const __nv_bfloat16* __restrict__ x, int 
         xs[(long long)r * groups + g] = s;
     }
 }
+
+// ---- launchers: C ABI, stream first, cudaGetLastError() returned as int, no allocation ----------
+//
+// Same shape as glm.cu's, so the Rust FFI (src/dflash.rs) reads like the rest of the crate: the
+// caller passes semantic counts and the launcher derives the grid. Block sizes are the kernels'
+// own requirements: 64 threads where normRope maps dim d to threadIdx.x (d and d + 64), 128 where a
+// thread owns one head dim, 256 everywhere the body strides by blockDim.x.
+
+static inline int df_check() { return (int)cudaGetLastError(); }
+
+extern "C" int glm_df_launch_tap(cudaStream_t st, const void* x, void* out, int rows, int slot, int mode) {
+    glm_df_tap<<<dim3(rows, D / 1024), 256, 0, st>>>((const __nv_bfloat16*)x, (__nv_bfloat16*)out, slot, mode);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_block_qkv(cudaStream_t st, const void* qkv, int ldq, const void* qn, const void* kn,
+                                       const void* pos, int rows, float eps, float theta, void* q, void* kb, void* vb) {
+    glm_df_block_qkv<<<dim3(rows, QH + KVH), 64, 0, st>>>((const __nv_bfloat16*)qkv, ldq, (const __nv_bfloat16*)qn,
+                                                          (const __nv_bfloat16*)kn, (const int*)pos, eps, theta,
+                                                          (__nv_bfloat16*)q, (__nv_bfloat16*)kb, (__nv_bfloat16*)vb);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_ctx_kv(cudaStream_t st, const void* kv, const void* kn, const void* pos, const void* rings,
+                                    int layer, int rows, float eps, float theta) {
+    glm_df_ctx_kv<<<dim3(rows, KVH), 64, 0, st>>>((const __nv_bfloat16*)kv, (const __nv_bfloat16*)kn, (const long long*)pos,
+                                                  (const uint64_t*)rings, layer, eps, theta);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_conv(cudaStream_t st, const void* z, const void* dyn, int which, const void* base, void* out,
+                                  int rows, int add) {
+    glm_df_conv<<<dim3(rows, D / 1024), 256, 0, st>>>((const __nv_bfloat16*)z, (const __nv_bfloat16*)dyn, which,
+                                                      (const __nv_bfloat16*)base, (__nv_bfloat16*)out, add);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_swiglu(cudaStream_t st, const void* gu, void* out, int rows, int F) {
+    glm_df_swiglu<<<dim3(rows, (F + 1023) / 1024), 256, 0, st>>>((const __nv_bfloat16*)gu, (__nv_bfloat16*)out, F);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_attn(cudaStream_t st, const void* q, const void* kb, const void* vb, const void* rings,
+                                  const void* starts, const void* froms, int blocks, int layer, float scale, void* o) {
+    glm_df_attn<<<dim3(blocks, KVH), 256, 0, st>>>((const __nv_bfloat16*)q, (const __nv_bfloat16*)kb,
+                                                   (const __nv_bfloat16*)vb, (const uint64_t*)rings,
+                                                   (const long long*)starts, (const long long*)froms, layer, scale,
+                                                   (__nv_bfloat16*)o);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_attn_part(cudaStream_t st, const void* q, const void* kb, const void* vb, const void* rings,
+                                       const void* starts, const void* froms, int blocks, int layer, float scale, int chunks,
+                                       void* pm, void* pl, void* pacc) {
+    glm_df_attn_part<<<dim3(blocks, KVH, chunks), 256, 0, st>>>(
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)kb, (const __nv_bfloat16*)vb, (const uint64_t*)rings,
+        (const long long*)starts, (const long long*)froms, layer, scale, (float*)pm, (float*)pl, (float*)pacc);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_attn_merge(cudaStream_t st, const void* pm, const void* pl, const void* pacc, int rows, void* o) {
+    glm_df_attn_merge<<<dim3(rows, QH), 128, 0, st>>>((const float*)pm, (const float*)pl, (const float*)pacc,
+                                                      (__nv_bfloat16*)o);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_add(cudaStream_t st, void* x, const void* y, int rows) {
+    glm_df_add<<<dim3(rows, D / 1024), 256, 0, st>>>((__nv_bfloat16*)x, (const __nv_bfloat16*)y);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_sumn(cudaStream_t st, const void* g, void* out, int rows, int world) {
+    glm_df_sumn<<<dim3(rows, D / 1024), 256, 0, st>>>((const float*)g, (__nv_bfloat16*)out, rows, world);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_top16_part(cudaStream_t st, const void* logits, int rows, int cols, int offset, void* pv,
+                                        void* pi) {
+    glm_df_top16_part<<<dim3(rows, (cols + CHUNK_COLS - 1) / CHUNK_COLS), 256, 0, st>>>(
+        (const __nv_bfloat16*)logits, cols, offset, (float*)pv, (int*)pi);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_top16_merge(cudaStream_t st, const void* pv, const void* pi, int rows, int chunks, void* out) {
+    glm_df_top16_merge<<<dim3(rows), 256, 0, st>>>((const float*)pv, (const int*)pi, chunks, (int*)out);
+    return df_check();
+}
+
+extern "C" int glm_df_launch_gsum(cudaStream_t st, const void* x, int ldx, int rows, int k, void* xs) {
+    glm_df_gsum<<<dim3(rows), 128, 0, st>>>((const __nv_bfloat16*)x, ldx, k, (float*)xs);
+    return df_check();
+}

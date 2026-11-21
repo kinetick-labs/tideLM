@@ -17,6 +17,7 @@
 //! semantic drift.
 
 pub mod blas;
+pub mod dflash;
 pub mod ds41;
 pub mod exl3;
 pub mod flash;

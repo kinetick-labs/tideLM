@@ -562,7 +562,7 @@ impl Engine {
         let nk = fl.nkda;
         let off = KdaW::offsets(dl, khl);
         let ldp = fa.ldp;
-        self.lin(&k.proj, np(&a.xn), h, t, np(&fa.proj), true)?;
+        self.lin_stack(&k.proj, np(&a.xn), h, t, np(&fa.proj), true)?;
         if !prefill && self.flash_pf {
             self.l2_lin(&k.o, t, self.pf_kda_o)?;
         }
@@ -614,7 +614,7 @@ impl Engine {
         let o = DsaW::OFFSETS_A;
         let lda = o[5];
         // proj_a: q_a | kv_a | wk | weights_proj | gate
-        self.lin(&d.proj_a, np(&a.xn), h, t, np(&fa.proj), true)?;
+        self.lin_stack(&d.proj_a, np(&a.xn), h, t, np(&fa.proj), true)?;
         ck(unsafe { glm_rmsnorm(st, np(&fa.proj), lda as i64, std::ptr::null(), 0, np(&d.q_norm), np(&a.qr), cfg.q_lora as i64, t as i32,
                                 cfg.q_lora as i32, cfg.rms_eps) }, "q norm")?;
         ck(unsafe { glm_rmsnorm(st, at(&fa.proj, o[1]), lda as i64, std::ptr::null(), 0, np(&d.kv_norm), np(&a.c), 512, t as i32, 512,
@@ -633,7 +633,7 @@ impl Engine {
                "index ring")?;
         }
         // proj_b: q_b (this rank's heads x 256) | wq_b; the indexer query contiguous for its scores
-        self.lin(&d.proj_b, np(&a.qr), cfg.q_lora, t, np(&fa.pb), true)?;
+        self.lin_stack(&d.proj_b, np(&a.qr), cfg.q_lora, t, np(&fa.pb), true)?;
         let ldb = d.proj_b.n_total();
         let iqw = cfg.index_heads * cfg.index_dim;
         unsafe {

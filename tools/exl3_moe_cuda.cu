@@ -1591,9 +1591,11 @@ __global__ void dense_rot_kernel(const TIN* __restrict__ x, int x_stride, const 
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
-// Splits summed in order, rotated, * svh of the row's group; bf16 (out_bf16) or fp32 out.
+// Splits summed in order, rotated, * svh of the row's group; bf16 (out_bf16) or fp32 out, at an
+// out row stride (elements; 0: tight, rows * N).
 __global__ void dense_out_kernel(const float* __restrict__ Z, const half* __restrict__ svh, void* __restrict__ out,
-                                 int rows, int N, int SK, int G, int out_bf16) {
+                                 int rows, int N, int SK, int G, int out_bf16, int out_stride) {
+    const size_t ldy = out_stride ? (size_t)out_stride : (size_t)N;
     pdl_enter();
     const int r = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
     const int n = blk * 128 + 4 * lane;
@@ -1610,9 +1612,9 @@ __global__ void dense_out_kernel(const float* __restrict__ Z, const half* __rest
     for (int j = 0; j < 4; ++j) {
         const float y = v[j] * HAD_SCALE * __half2float(sv[j]);
         if (out_bf16)
-            reinterpret_cast<__nv_bfloat16*>(out)[(size_t)r * N + n + j] = __float2bfloat16_rn(y);
+            reinterpret_cast<__nv_bfloat16*>(out)[r * ldy + n + j] = __float2bfloat16_rn(y);
         else
-            reinterpret_cast<float*>(out)[(size_t)r * N + n + j] = y;
+            reinterpret_cast<float*>(out)[r * ldy + n + j] = y;
     }
 }
 
@@ -1993,9 +1995,9 @@ void exl3m_rot_in_shared(const void* x, int x_stride, const int* pick, const voi
 }
 
 void exl3m_dense_out(const float* Z, const void* svh, void* out, int rows, int N, int SK, int G, int out_bf16,
-                     cudaStream_t s) {
+                     int out_stride, cudaStream_t s) {
     dim3 grid((unsigned)rows, (unsigned)(N / 128));
-    pdl_launch(exl3::dense_out_kernel, grid, 32, 0, s, Z, (const half*)svh, out, rows, N, SK, G, out_bf16);
+    pdl_launch(exl3::dense_out_kernel, grid, 32, 0, s, Z, (const half*)svh, out, rows, N, SK, G, out_bf16, out_stride);
 }
 
 void exl3m_down_combine(const float* Z, const int* pick, const void* svh_d, const float* wts, float* out,

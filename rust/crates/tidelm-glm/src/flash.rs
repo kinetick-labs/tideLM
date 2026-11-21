@@ -20,9 +20,9 @@ use tidelm_kernels::glm::glm_quant_kvb_bf16;
 use tidelm_model::Checkpoint;
 
 use crate::config::GlmConfig;
-use crate::lin::{self, Bf16Mat, Lin};
+use crate::lin::{self, Bf16Mat, Lin, RowStack};
 use crate::weights::{bf16_from_f32, Attn, Cut, DsaW, Embed, HcW, KdaW, Layer, Loader, Mlp, MtpExtra, Weights,
-                    SPLIT_DOWN, SPLIT_EH, SPLIT_HEAD, SPLIT_O, SPLIT_UP};
+                    SPLIT_DOWN, SPLIT_EH, SPLIT_HEAD, SPLIT_KVA, SPLIT_QA, SPLIT_O, SPLIT_UP};
 use crate::{ck, Result};
 
 const P: &str = "model.language_model.";
@@ -210,12 +210,12 @@ impl Ld<'_> {
         for (name, r) in parts {
             let r = match r {
                 Some(r) => r.clone(),
-                None => 0..self.dims(name)?.0,
+                None => 0..self.dims_any(name)?.0,
             };
             if r.len() % 32 != 0 {
                 return Err(format!("{name}: {} rows, not whole 32-row blocks", r.len()).into());
             }
-            let (v, k) = self.rows(name, r.clone())?;
+            let (v, k) = self.rows_any(name, r.clone())?;
             if k0 != 0 && k != k0 {
                 return Err(format!("{name}: K {k}, the fused matrix's {k0}").into());
             }
@@ -297,16 +297,22 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
                     let (w, n) = d.cols(&format!("{a}o_proj.weight"), r * dl..(r + 1) * dl)?;
                     d.lin(w, n, dl, 1)?
                 };
-                if d.exl3() {
-                    // the fused proj is one EXL3 qkv_proj (q|k|v, 3 dl rows) plus F16 f_a|g_a|b rows:
-                    // two matrices over one output buffer, which needs the epilogue's output stride
-                    // (RowStack). Not built yet, so refuse rather than serve a wrong layout.
-                    return Err(format!("{a}proj: GLM_FLASH_DENSE=exl3 needs the split qkv_proj form (not built)").into());
-                }
+                // proj's rows: q | k | v | f_a | g_a | b (KdaW::offsets). The SAGE checkpoint
+                // quantises q|k|v as one EXL3 qkv_proj ([q | k | v] in blocks, exllamav3's
+                // gated_delta_net.py) and leaves f_a | g_a | b F16; other checkpoints fuse all six
+                // into one matrix. Each format's part writes its columns at the stack's stride.
+                let proj = if d.exl3() {
+                    let qkv = Lin::Exl3(d.ld.exl3(&[&format!("{a}qkv_proj")], 1, Cut::None, None)?);
+                    let tail = d.fused(&[(format!("{a}f_a_proj.weight"), None), (format!("{a}g_a_proj.weight"), None),
+                                         (format!("{a}b_proj.weight"), hcut(khl))], 1)?;
+                    RowStack::new(vec![qkv, tail])
+                } else {
+                    RowStack::new(vec![d.fused(&[(format!("{a}q_proj.weight"), hcut(dl)), (format!("{a}k_proj.weight"), hcut(dl)),
+                                                 (format!("{a}v_proj.weight"), hcut(dl)), (format!("{a}f_a_proj.weight"), None),
+                                                 (format!("{a}g_a_proj.weight"), None), (format!("{a}b_proj.weight"), hcut(khl))], 1)?])
+                };
                 Attn::Kda(KdaW {
-                    proj: d.fused(&[(format!("{a}q_proj.weight"), hcut(dl)), (format!("{a}k_proj.weight"), hcut(dl)),
-                                    (format!("{a}v_proj.weight"), hcut(dl)), (format!("{a}f_a_proj.weight"), None),
-                                    (format!("{a}g_a_proj.weight"), None), (format!("{a}b_proj.weight"), hcut(khl))], 1)?,
+                    proj,
                     f_b: d.fused(&[(format!("{a}f_b_proj.weight"), hcut(dl))], 1)?,
                     g_b: d.fused(&[(format!("{a}g_b_proj.weight"), hcut(dl))], 1)?,
                     conv,
@@ -336,18 +342,32 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
                     let (w, n) = d.cols(&format!("{a}o_proj.weight"), r * hl * vd..(r + 1) * hl * vd)?;
                     d.lin(w, n, hl * vd, 4)?
                 };
-                if d.exl3() {
-                    // q_a | kv_a are EXL3 and wk | weights_proj | gate are F16: two/three matrices over
-                    // one output buffer, which needs the epilogue's output stride (RowStack). Not built.
-                    return Err(format!("{a}proj_a: GLM_FLASH_DENSE=exl3 needs the split form (not built)").into());
-                }
+                // proj_a's rows: q_a | kv_a | wk | weights_proj | gate (DsaW::OFFSETS_A). The SAGE
+                // checkpoint quantises q_a and kv_a as separate EXL3 matrices (the loader refuses a
+                // mixed-shape group) and leaves the indexer's three F16; other checkpoints fuse all
+                // five. proj_b's rows: q_b | wq_b -- two EXL3 matrices of different shapes and bits.
+                let (proj_a, proj_b) = if d.exl3() {
+                    (RowStack::new(vec![
+                        Lin::Exl3(d.ld.exl3(&[&format!("{a}q_a_proj")], SPLIT_QA, Cut::None, None)?),
+                        Lin::Exl3(d.ld.exl3(&[&format!("{a}kv_a_proj_with_mqa")], SPLIT_KVA, Cut::None, None)?),
+                        d.fused(&[(format!("{i}wk.weight"), None), (format!("{i}weights_proj.weight"), None),
+                                  (format!("{i}index_kpool_compress_gate"), None)], 1)?,
+                     ]),
+                     RowStack::new(vec![
+                        Lin::Exl3(d.ld.exl3(&[&format!("{a}q_b_proj")], 1, Cut::N, None)?),
+                        Lin::Exl3(d.ld.exl3(&[&format!("{i}wq_b")], 1, Cut::None, None)?),
+                     ]))
+                } else {
+                    (RowStack::new(vec![d.fused(&[(format!("{a}q_a_proj.weight"), None), (format!("{a}kv_a_proj_with_mqa.weight"), None),
+                                                  (format!("{i}wk.weight"), None), (format!("{i}weights_proj.weight"), None),
+                                                  (format!("{i}index_kpool_compress_gate"), None)], 1)?]),
+                     RowStack::new(vec![d.fused(&[(format!("{a}q_b_proj.weight"), hcut(hl * cfg.qk_dim())), (format!("{i}wq_b.weight"), None)], 1)?]))
+                };
                 Attn::Dsa(DsaW {
-                    proj_a: d.fused(&[(format!("{a}q_a_proj.weight"), None), (format!("{a}kv_a_proj_with_mqa.weight"), None),
-                                      (format!("{i}wk.weight"), None), (format!("{i}weights_proj.weight"), None),
-                                      (format!("{i}index_kpool_compress_gate"), None)], 1)?,
+                    proj_a,
                     q_norm: d.bf16_dev(&format!("{a}q_a_layernorm.weight"))?,
                     kv_norm: d.bf16_dev(&format!("{a}kv_a_layernorm.weight"))?,
-                    proj_b: d.fused(&[(format!("{a}q_b_proj.weight"), hcut(hl * cfg.qk_dim())), (format!("{i}wq_b.weight"), None)], 1)?,
+                    proj_b,
                     kvb_q,
                     kvb_s,
                     o,

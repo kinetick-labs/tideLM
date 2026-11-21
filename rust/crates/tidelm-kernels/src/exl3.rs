@@ -104,7 +104,7 @@ extern "C" {
     pub fn exl3m_dense_rot(x: *const c_void, x_stride: c_int, suh: *const c_void, out: *mut c_void, rows: c_int,
                            k: c_int, g: c_int, x_bf16: c_int, s: CudaStream);
     pub fn exl3m_dense_out(z: *const c_void, svh: *const c_void, out: *mut c_void, rows: c_int, n: c_int, sk: c_int,
-                           g: c_int, out_bf16: c_int, s: CudaStream);
+                           g: c_int, out_bf16: c_int, out_stride: c_int, s: CudaStream);
     pub fn exl3m_down_combine(z: *const c_void, pick: *const c_void, svh_d: *const c_void, wts: *const c_void,
                               out: *mut c_void, rows: c_int, p: c_int, d: c_int, sk: c_int, slots: c_int, e: c_int,
                               s: CudaStream);

@@ -12,7 +12,7 @@ use tidelm_kernels::glm::*;
 use tidelm_model::Checkpoint;
 
 use crate::config::GlmConfig;
-use crate::lin::Lin;
+use crate::lin::{Lin, RowStack};
 use crate::{ck, Result};
 
 /// Decode calls take at most this many rows (exl3_dense.MAX_ROWS); more go the prefill path.
@@ -132,7 +132,7 @@ impl Exl3Mat {
     /// Decode (rows <= 16): rotate in, the grouped split-K GEMV, combine + rotate out.
     /// x bf16 rows (ldx elements apart) -> out [rows][G * N] contiguous, bf16 or fp32.
     pub fn decode(&self, st: &Stream, m: &Members, s: &Exl3Scratch, x: *const c_void, ldx: usize, rows: usize,
-                  out: *mut c_void, out_bf16: bool) -> Result<()> {
+                  out: *mut c_void, ldy: usize, out_bf16: bool) -> Result<()> {
         if rows == 0 || rows > MAX_ROWS {
             return Err(format!("EXL3 decode call of {rows} rows").into());
         }
@@ -152,7 +152,7 @@ impl Exl3Mat {
                           count, members, s.z.raw(), k as i32, n as i32, r as i32, split as i32, MAX_MEMBERS,
                           g as i32, g as i32, 1, self.nt as i32, 4, self.pf, 2, self.hi, self.cb, st.raw());
             exl3m_dense_out(s.z.raw(), self.svh.raw(), out, r as i32, n as i32, split as i32, g as i32,
-                            out_bf16 as i32, st.raw());
+                            out_bf16 as i32, ldy as i32, st.raw());
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "exl3 decode")
     }
@@ -171,7 +171,7 @@ impl Exl3Mat {
     /// cuBLAS (fp32 accumulation), combine + rotate out (Exl3Lin._prefill). out [rows][N].
     #[allow(clippy::too_many_arguments)]
     pub fn prefill(&self, st: &Stream, blas: &Blas, s: &Exl3Scratch, grp: usize, x: *const c_void, ldx: usize,
-                   rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
+                   rows: usize, out: *mut c_void, ldy: usize, out_bf16: bool) -> Result<()> {
         let (k, n) = (self.k, self.n);
         if rows * k > s.xh.len() || k * n > s.wq.len() || rows * n > s.z.len() {
             return Err(format!("EXL3 prefill of {rows} x {k} x {n}: scratch too small").into());
@@ -183,7 +183,7 @@ impl Exl3Mat {
         ck(unsafe { glm_exl3_unpack_cb(st.raw(), tr, k as i32, n as i32, self.bits[grp] as i32, self.cb, s.wq.raw()) }, "exl3 unpack")?;
         blas.gemm_rm(rows, n, k, Mat { ptr: s.xh.raw(), ty: R_16F, ld: k as i64 }, Mat { ptr: s.wq.raw(), ty: R_16F, ld: n as i64 },
                      false, s.z.raw(), R_32F, n as i64)?;
-        unsafe { exl3m_dense_out(s.z.raw(), self.svh.ptr_at(grp * n), out, rows as i32, n as i32, 1, 1, out_bf16 as i32, st.raw()) };
+        unsafe { exl3m_dense_out(s.z.raw(), self.svh.ptr_at(grp * n), out, rows as i32, n as i32, 1, 1, out_bf16 as i32, ldy as i32, st.raw()) };
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "exl3 prefill")
     }
 }
@@ -461,7 +461,7 @@ pub struct MlaW {
 /// GLM-5.3-Flash's KDA layer. `proj` rows: this rank's q | k | v (dl = heads x 128 each), f_a and
 /// g_a (128 each, whole), this rank's b (a row a head): KDA_PROJ_OFFSETS.
 pub struct KdaW {
-    pub proj: Lin,
+    pub proj: RowStack,
     /// f_b, g_b [dl][128]: the forget gate's and the output gate's second halves
     pub f_b: Lin,
     pub g_b: Lin,
@@ -486,10 +486,10 @@ impl KdaW {
 /// the pools' compress gate 128; `proj_b` rows (from q_a's norm): this rank's q_b heads x 256 |
 /// the indexer's wq_b 32 x 128.
 pub struct DsaW {
-    pub proj_a: Lin,
+    pub proj_a: RowStack,
     pub q_norm: DeviceBuffer<u16>,
     pub kv_norm: DeviceBuffer<u16>,
-    pub proj_b: Lin,
+    pub proj_b: RowStack,
     /// kv_b of this rank's heads: FP8 [hl * 512][512], scales [hl * 512][4]
     pub kvb_q: DeviceBuffer<u8>,
     pub kvb_s: DeviceBuffer<f32>,

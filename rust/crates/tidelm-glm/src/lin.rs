@@ -45,6 +45,47 @@ pub enum Lin {
     Bf16(Bf16Mat),
 }
 
+/// Linear layers whose output columns stack into one buffer: a checkpoint fuses matrices of
+/// several formats over one input (the KDA proj is EXL3 qkv_proj then BF16 f_a|g_a|b; the sparse
+/// layer proj_a is EXL3 q_a then EXL3 kv_a then BF16 wk|weights_proj|gate, proj_b is EXL3 q_b then
+/// EXL3 wq_b -- the loader refuses mixed-shape groups, so one `Lin` cannot span them). One part
+/// writes its columns at its offset, every row at the stack's stride; `n_total` is the row's width
+/// (a part is whole columns, no padding between them). With one part it is that Lin, bit for bit.
+pub struct RowStack {
+    pub parts: Vec<Lin>,
+}
+
+impl RowStack {
+    pub fn new(parts: Vec<Lin>) -> Self {
+        assert!(!parts.is_empty(), "an empty RowStack");
+        RowStack { parts }
+    }
+
+    /// Output columns a row.
+    pub fn n_total(&self) -> usize {
+        self.parts.iter().map(Lin::n_total).sum()
+    }
+
+    pub fn k(&self) -> usize {
+        let k = self.parts[0].k();
+        assert!(self.parts.iter().all(|m| m.k() == k), "a RowStack of unequal K");
+        k
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.parts.iter().map(Lin::bytes).sum()
+    }
+
+    /// Each part's first output column in the stack's row.
+    pub fn part_offsets(&self) -> Vec<usize> {
+        self.parts.iter().scan(0, |o, m| {
+            let at = *o;
+            *o += m.n_total();
+            Some(at)
+        }).collect()
+    }
+}
+
 impl Lin {
     /// Output columns a row.
     pub fn n_total(&self) -> usize {

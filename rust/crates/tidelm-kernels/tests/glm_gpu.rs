@@ -202,13 +202,13 @@ fn exl3_unpack_matches_the_oracle_and_both_paths_match_the_reference() {
                       p(&d_z), k as i32, n as i32, t as i32, sk as i32, 16, 1, 1, 1, 8, 4, 1, 2, 10, CB_MUL1, st.raw())
     };
     let d_yd = DeviceBuffer::<f32>::new(t * n).unwrap();
-    unsafe { exl3m_dense_out(p(&d_z), p(&d_svh), p(&d_yd), t as i32, n as i32, sk as i32, 1, 0, st.raw()) };
+    unsafe { exl3m_dense_out(p(&d_z), p(&d_svh), p(&d_yd), t as i32, n as i32, sk as i32, 1, 0, 0, st.raw()) };
     let blas = Blas::new(st.raw()).unwrap();
     let d_zp = DeviceBuffer::<f32>::new(t * n).unwrap();
     blas.gemm_rm(t, n, k, Mat { ptr: d_xh.raw(), ty: R_16F, ld: k as i64 }, Mat { ptr: d_w.raw(), ty: R_16F, ld: n as i64 },
                  false, d_zp.raw(), R_32F, n as i64).unwrap();
     let d_yp = DeviceBuffer::<f32>::new(t * n).unwrap();
-    unsafe { exl3m_dense_out(p(&d_zp), p(&d_svh), p(&d_yp), t as i32, n as i32, 1, 1, 0, st.raw()) };
+    unsafe { exl3m_dense_out(p(&d_zp), p(&d_svh), p(&d_yp), t as i32, n as i32, 1, 1, 0, 0, st.raw()) };
     last_ok();
     let (yd, yp) = (d_yd.download().unwrap(), d_yp.download().unwrap());
     let mut want = vec![0f64; t * n];
@@ -1001,7 +1001,7 @@ fn exlr8_codebook_matches_the_reference() {
             unsafe {
                 exl3m_grouped(p(&d_xh), p(&d_xh), p(&d_ptr), p(&d_ptr), p(&d_k2), p(&d_k2), p(&d_uids), p(&d_cnt), p(&d_mem),
                               p(&d_z), k as i32, n as i32, t as i32, sk as i32, 16, 1, 1, 1, 8, 4, 1, 2, 10, cb, st.raw());
-                exl3m_dense_out(p(&d_z), p(&d_svh), p(&d_y), t as i32, n as i32, sk as i32, 1, 0, st.raw());
+                exl3m_dense_out(p(&d_z), p(&d_svh), p(&d_y), t as i32, n as i32, sk as i32, 1, 0, 0, st.raw());
             }
             last_ok();
             errs.push(rel_err(&d_y.download().unwrap(), &want));

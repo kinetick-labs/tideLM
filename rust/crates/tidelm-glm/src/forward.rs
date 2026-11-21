@@ -33,7 +33,7 @@ use tidelm_kernels::glm::*;
 
 use crate::arena::{Arena, Pack};
 use crate::config::{AttnKind, GlmConfig};
-use crate::lin::Lin;
+use crate::lin::{Lin, RowStack};
 use crate::weights::{Exl3Mat, Exl3Scratch, Members, Mlp, Weights, DECODE_PF_ROUTED, MAX_ROWS};
 use crate::{ck, Result};
 
@@ -859,15 +859,17 @@ impl Engine {
     // ------------------------------------------------------------------ matrices
     /// x [rows][ldx] bf16 -> out [rows][N] through an EXL3 matrix's decode or prefill path.
     fn exl3(&self, m: &Exl3Mat, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
-        self.exl3_on(&self.st, &self.act.x3s, m, x, ldx, rows, out, out_bf16)
+        self.exl3_on(&self.st, &self.act.x3s, m, x, ldx, rows, out, 0, out_bf16)
     }
 
-    /// exl3 on a given stream with its own scratch (decode rows only off the main stream).
+    /// exl3 on a given stream with its own scratch (decode rows only off the main stream). `ldy`: the
+    /// output row stride in elements (0: tight, N a row) -- a stack part writes its columns into
+    /// the stack wider rows.
     #[allow(clippy::too_many_arguments)]
     fn exl3_on(&self, st: &Stream, x3: &Exl3Scratch, m: &Exl3Mat, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void,
-               out_bf16: bool) -> Result<()> {
+               ldy: usize, out_bf16: bool) -> Result<()> {
         if rows <= MAX_ROWS {
-            m.decode(st, &self.members, x3, x, ldx, rows, out, out_bf16)
+            m.decode(st, &self.members, x3, x, ldx, rows, out, ldy, out_bf16)
         } else if rows <= GEMV_ROWS {
             // a short prompt: the decode GEMV over 16-row blocks reads each trellis rows / 16
             // times, where unpacking it writes and rereads 2 bytes a weight (16 bits against 3-5)
@@ -875,14 +877,14 @@ impl Engine {
             for r0 in (0..rows).step_by(MAX_ROWS) {
                 let n = MAX_ROWS.min(rows - r0);
                 let xi = unsafe { (x as *const u16).add(r0 * ldx) } as *const c_void;
-                let oi = unsafe { (out as *mut u8).add(r0 * m.g * m.n * esz) } as *mut c_void;
-                m.decode(st, &self.members, x3, xi, ldx, n, oi, out_bf16)?;
+                let oi = unsafe { (out as *mut u8).add(r0 * if ldy > 0 { ldy } else { m.g * m.n } * esz) } as *mut c_void;
+                m.decode(st, &self.members, x3, xi, ldx, n, oi, ldy, out_bf16)?;
             }
             Ok(())
         } else {
             for g in 0..m.g {
-                let o = unsafe { (out as *mut u8).add(g * rows * m.n * if out_bf16 { 2 } else { 4 }) } as *mut c_void;
-                m.prefill(&self.st, &self.blas, &self.act.x3s, g, x, ldx, rows, o, out_bf16)?;
+                let o = unsafe { (out as *mut u8).add(g * rows * if ldy > 0 { ldy } else { m.n } * if out_bf16 { 2 } else { 4 }) } as *mut c_void;
+                m.prefill(&self.st, &self.blas, &self.act.x3s, g, x, ldx, rows, o, ldy, out_bf16)?;
             }
             Ok(())
         }
@@ -892,16 +894,42 @@ impl Engine {
     /// (exl3_on), or ds41.cu's FP8 / BF16 GEMV and GEMM (lin::gemm, `part` its split-K partials).
     #[allow(clippy::too_many_arguments)]
     fn lin_on(&self, st: &Stream, x3: &Exl3Scratch, part: &DeviceBuffer<f32>, m: &Lin, x: *const c_void, ldx: usize, rows: usize,
-              out: *mut c_void, out_bf16: bool) -> Result<()> {
+              out: *mut c_void, ldy: usize, out_bf16: bool) -> Result<()> {
         match m {
-            Lin::Exl3(e) => self.exl3_on(st, x3, e, x, ldx, rows, out, out_bf16),
-            _ => crate::lin::gemm(st, part, x, ldx, m, rows, out, !out_bf16, m.n_total()),
+            Lin::Exl3(e) => self.exl3_on(st, x3, e, x, ldx, rows, out, ldy, out_bf16),
+            _ => crate::lin::gemm(st, part, x, ldx, m, rows, out, !out_bf16, if ldy > 0 { ldy } else { m.n_total() }),
         }
+    }
+
+    /// A RowStack: each part over the same input, its output columns one after another in one
+    /// buffer rows (at the stack stride). The EXL3 parts epilogues and the dense parts GEMM
+    /// both take the stride, so the stack needs no copy.
+    #[allow(clippy::too_many_arguments)]
+    fn lin_stack_on(&self, st: &Stream, x3: &Exl3Scratch, part: &DeviceBuffer<f32>, s: &RowStack, x: *const c_void, ldx: usize,
+                    rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
+        let ldy = s.n_total();
+        let esz = if out_bf16 { 2 } else { 4 };
+        let mut off = 0;
+        // a multi-group EXL3 part interleaves its groups' rows (decode) or writes sequential
+        // blocks (prefill): neither matches a stack's column offsets, and every stack member is
+        // built split 1.
+        debug_assert!(s.parts.iter().all(|m| !matches!(m, Lin::Exl3(e) if e.g > 1)), "a stacked EXL3 part split > 1");
+        for m in &s.parts {
+            let o = unsafe { (out as *mut u8).add(off * esz) } as *mut c_void;
+            self.lin_on(st, x3, part, m, x, ldx, rows, o, ldy, out_bf16)?;
+            off += m.n_total();
+        }
+        Ok(())
     }
 
     /// lin_on on the main stream.
     fn lin(&self, m: &Lin, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
-        self.lin_on(&self.st, &self.act.x3s, &self.act.split_part, m, x, ldx, rows, out, out_bf16)
+        self.lin_on(&self.st, &self.act.x3s, &self.act.split_part, m, x, ldx, rows, out, 0, out_bf16)
+    }
+
+    /// A RowStack on the main stream.
+    fn lin_stack(&self, s: &RowStack, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
+        self.lin_stack_on(&self.st, &self.act.x3s, &self.act.split_part, s, x, ldx, rows, out, out_bf16)
     }
 
     /// A Lin's first `budget` bytes into L2 (l2_mat for an EXL3 matrix; a dense one from its start).
@@ -913,6 +941,16 @@ impl Engine {
                 self.l2_runs(base, bytes.min(budget as u64), 0, 1)
             }
         }
+    }
+
+    /// A RowStack's first `budget` bytes into L2: the budget over its parts, each from its start.
+    fn l2_stack(&self, s: &RowStack, rows: usize, budget: usize) -> Result<()> {
+        let n = s.parts.len();
+        for (i, m) in s.parts.iter().enumerate() {
+            let b = budget * (i + 1) / n - budget * i / n;
+            self.l2_lin(m, rows, b)?;
+        }
+        Ok(())
     }
 
     /// The SwiGLU of gate / up halves (`ld` apart a row) -> bf16 [t][n]: GLM-5.3's glm_swiglu, or
@@ -1033,7 +1071,7 @@ impl Engine {
         if decode {
             self.fork()?;
         }
-        self.exl3_on(sst, x3, &lw.kv_a, np(&a.xn), h, t, np(&a.ckv), true)?;
+        self.exl3_on(sst, x3, &lw.kv_a, np(&a.xn), h, t, np(&a.ckv), 0, true)?;
         let ldk = lw.kv_a.n;
         ck(unsafe { glm_rmsnorm(s2, np(&a.ckv), ldk as i64, std::ptr::null(), 0, np(&lw.kv_norm), np(&a.c), 512, t as i32, 512,
                                 1e-6) }, "kv norm")?;
@@ -1063,7 +1101,7 @@ impl Engine {
         let index_decode = |ist: &Stream, x3: &Exl3Scratch| -> Result<()> {
             let ix = lw.index.as_ref().unwrap();
             let s = ist.raw();
-            self.exl3_on(ist, x3, &ix.wq_b, np(&a.qr), cfg.q_lora, t, np(&a.qi), true)?;
+            self.exl3_on(ist, x3, &ix.wq_b, np(&a.qr), cfg.q_lora, t, np(&a.qi), 0, true)?;
             ck(unsafe { glm_rope(s, np(&a.qi), 4096, 128, np(&a.qi), 4096, 128, t as i32, 32, np(&self.w.cos), np(&self.w.sin),
                                  posb) }, "rope index q")?;
             let (ix_q, ix_s) = (kv.iq.unwrap().raw(), kv.is.unwrap().raw());
@@ -1339,7 +1377,7 @@ impl Engine {
     fn shared_up(&self, sst: &Stream, x3: &Exl3Scratch, sh_gate_up: &Lin, il: usize, x: *mut c_void, n: usize) -> Result<()> {
         let a = &self.act;
         let part = if std::ptr::eq(sst, &self.st2) { &a.split_part2 } else { &a.split_part };
-        self.lin_on(sst, x3, part, sh_gate_up, x, self.cfg.hidden, n, np(&a.gu), true)?;
+        self.lin_on(sst, x3, part, sh_gate_up, x, self.cfg.hidden, n, np(&a.gu), 0, true)?;
         let hsh = at(&a.pair, n * self.cfg.topk * il * 2);
         let (hn, uo, ld) = sh_gate_up.gu_layout(n, GEMV_ROWS);
         debug_assert_eq!(hn, il);
@@ -1513,7 +1551,7 @@ impl Engine {
         }
         let part = if decode { &a.split_part2 } else { &a.split_part };
         if let Some((_, sh_down)) = shared_x {
-            self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
+            self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), 0, false)?;
         }
         unsafe {
             if up_tiled && self.fat {
@@ -1552,8 +1590,8 @@ impl Engine {
                     self.l2_mat(&m.q_a, n, PF_QA)?;
                     self.l2_mat(&m.kv_a, n, PF_KVA)?;
                 }
-                Some(crate::weights::Attn::Kda(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
-                Some(crate::weights::Attn::Dsa(d)) => self.l2_lin(&d.proj_a, n, PF_QA + PF_KVA)?,
+                Some(crate::weights::Attn::Kda(k)) => self.l2_stack(&k.proj, n, PF_QA + PF_KVA)?,
+                Some(crate::weights::Attn::Dsa(d)) => self.l2_stack(&d.proj_a, n, PF_QA + PF_KVA)?,
                 Some(crate::weights::Attn::Ink(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
                 None => {}
             }

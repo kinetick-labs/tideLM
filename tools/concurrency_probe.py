@@ -125,16 +125,22 @@ def main():
 
     print(f"model {model}: {len(prompts)} prompts of ~{a.isl} chars, {a.osl} tokens each")
     serial, serial_wall = [], 0.0
-    for _ in range(a.repeat):
+    for w in range(a.repeat):
         for i in range(len(prompts)):
             t0 = time.time()
-            serial.append(one(i))
+            r = one(i)
+            if r:
+                r["wave"], r["mode"] = w, "serial"
+            serial.append(r)
             serial_wall += time.time() - t0
     conc, conc_wall = [], 0.0
-    for _ in range(a.repeat):
-        r, w = batch()
+    for w in range(a.repeat):
+        r, secs = batch()
+        for x in r:
+            if x:
+                x["wave"], x["mode"] = w, "parallel"
         conc += r
-        conc_wall += w
+        conc_wall += secs
 
     def med(rows, key):
         v = [r[key] for r in rows if r and r.get(key)]
@@ -154,6 +160,19 @@ def main():
                   f"decode {r.get('decode_tok_s') or float('nan'):.2f} tok/s out {r.get('out_tokens')}")
     bad = [r for r in conc if not r or r.get("error")]
     print(f"\n  threads ok {len(conc) - len(bad)}/{len(conc)}")
+
+    # A repeat is the same four prompts again: a prefix the cache kept answers in well under a
+    # second, so a wave whose TTFTs stay at full prefill cost tells us the cache did NOT keep it --
+    # which under concurrency means another lane's pages were reclaimed, not that the prompt changed.
+    print("\n  wave      ttft per request (s)              restored  <-- repeats of the same prompts")
+    for mode in ("serial", "parallel"):
+        for w in range(a.repeat):
+            rows = [r for r in (serial if mode == "serial" else conc) if r and r.get("wave") == w]
+            if not rows:
+                continue
+            tt = " ".join(f"{(r.get('ttft_s') or 0):6.2f}" for r in rows)
+            hit = sum(1 for r in rows if (r.get("ttft_s") or 99) < 0.5)
+            print(f"  {mode} {w}  {tt}   {hit}/{len(rows)}")
     return 0 if not bad else 1
 
 

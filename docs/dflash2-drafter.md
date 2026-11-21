@@ -76,3 +76,66 @@ BLOCK=8, GROUP=16, CH=16`, and a per-layer ring of K then V, `[WIN][KVW]` each. 
 * `tools/generation_gate.py` 6/6 and `tools/concurrency_probe.py` aggregate not below 26.26 tok/s.
 * Memory: the drafter is 2.2 GB; `MemAvailable` under this engine was 12.4 GiB, so it should land
   near 10 GiB — measure, do not assume.
+
+## The call order, read out of TensorFold
+
+`zig/src/families/glm/dflash_block.zig` is the device sequence and `dflash_select.zig` is the
+selector; both are 187 and 64 lines and are the whole specification. Written out, with the buffers
+our port names:
+
+**Ingest** (context rows into the rings, `N` rows): `c1 = fc(cin)` where `cin` is `[N][5 * 4096]` (the
+five taps) and `fc` is `[4096][20480]`; `ctx = rmsnorm(c1, hidden_norm)`; per layer `ckv = kv(ctx)`
+(`kv` is `[2048][4096]`: k and v projected together, `[N][2 * KVW]`), then `df_ctx_kv` norms+rotates
+it at `cpos` and writes the ring slot.
+
+**Block** (`M = streams * 8` rows, position `bpos`, ring per stream, `starts`/`froms` per stream),
+per layer:
+
+```
+y   = rmsnorm(x, in_norm)                 // [M][4096]
+dyn = a_proj(y)                           // [M][1024] = [which][tap][group], 2 * 2 * 256
+y2  = conv(y, which=0, a_base)            // the two-tap dynamic causal conv, no add
+qkv = qkv_lin(y2)                         // [M][6144] = q(4096) | k(1024) | v(1024)
+      df_block_qkv → q, kb, vb            // per-head RMSNorm + RoPE at bpos
+      df_attn_part + df_attn_merge → att  // sliding window from the ring + the block's own 8 keys
+a   = o(att)                              // [M][4096]
+x   = x + conv(a, which=1, a_base + 2*D*2) // the same dyn, the second tap pair, added to the residual
+y   = rmsnorm(x, post_norm)
+dyn = m_proj(y)
+y2  = conv(y, which=0, m_base)
+gu  = gu_lin(y2)                          // [M][24576]
+act = swiglu(gu)                          // [M][12288]
+x   = x + conv(down(act), which=1, m_base + 2*D*2)
+```
+
+then, once for the block: `hn = rmsnorm(x, norm)` with the 64-column group sums `xs` for a 4-bit head,
+`logits = head(hn)` row by row, `df_top16_part` + `df_top16_merge` → 16 candidates a row (id, value),
+and `g = hidden_projection(hn)` → `[M][256]`.
+
+**Selector** (rank 0, `dflash_select.zig`): for `t = 1..8`, take the row's 16 candidates, `pg =
+predecessor_codebook[prev] * g` (`prev` starts at the anchor), score each candidate
+`value + dot(pg, successor_codebook[id])`, keep the argmax, `prev = id`, emit 7 drafts. Greedy, with
+the temperature's chance reported beside them. `predecessor_codebook`/`successor_codebook` are
+`[154880][256]` bf16 -- the whole vocabulary, which is what makes a 256-wide hidden enough to trace a
+path.
+
+Two things this engine has to decide, that TensorFold does not:
+
+* **The head.** TensorFold scores the block with the target's MTP *draft* head (`e.w.mtp.?.draft`,
+  4-bit, this rank's vocabulary slice). Our EXL3 boot has no listed-vocabulary draft head (an EXL3
+  matrix cannot be gathered by id), so the block's logits have to come from the target's main head
+  over 8 rows -- one small matmul a round, and the honest choice until a bf16 head exists.
+* **The taps.** Our forward must hand over the same `[rows][4 * 4096]` capture TensorFold's `df_tap`
+  reads -- the four streams of the target residual at layers 5, 14, 24, 33, 42, averaged -- or the
+  drafter runs on an input it was not trained for and acceptance silently collapses.
+
+## The checkpoint's actual tensors (81, read from the safetensors header)
+
+`fc` 4096x20480, `hidden_norm` 4096, `norm` 4096, `candidate_selector.hidden_projection` 256x4096,
+`candidate_selector.{predecessor,successor}_codebook` 154880x256, and per layer (5):
+`input_layernorm`, `post_attention_layernorm` 4096; `self_attn.{q_proj}` 4096x4096, `{k_proj,v_proj}`
+1024x4096, `o_proj` 4096x4096, `{q_norm,k_norm}` 128; `attention_conv.{base_kernel}` 2x2x4096 and
+`{kernel_projection}` 1024x4096; `mlp.{gate_proj,up_proj}` 12288x4096, `down_proj` 4096x12288;
+`mlp_conv.{base_kernel}` 2x2x4096 and `{kernel_projection}` 1024x4096. **No `lm_head` and no
+`embed_tokens`**: the drafter scores through the target's head and reads the anchor's embedding from
+the target.

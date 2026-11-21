@@ -59,7 +59,8 @@ PROMPTS = [
                 "docstrings and type hints."),
     dict(name="html", temperature=0.0, kind="html", min_tokens=900,
          prompt="Write a complete single-file HTML game: tic-tac-toe on a 3x3 grid with inline "
-                "CSS and JavaScript, a win check, and a reset button. Output only the file."),
+                "CSS and JavaScript, a win check, a reset button and a scoreboard. Output only the "
+                "file."),
     dict(name="javascript", temperature=0.0, kind="js", min_tokens=900,
          prompt="Write a complete JavaScript module implementing a priority queue with a binary "
                 "heap, an iterator, JSDoc comments, and a set of assertions exercising it."),
@@ -132,14 +133,30 @@ def structural(text: str, kind: str) -> list[str]:
     return bad
 
 
+THINKING = False
+
+
 def run_one(base, model, spec, max_tokens, seed):
+    # The gate scores the ANSWER: a reasoning model that spends the whole cap thinking returns an
+    # empty content and nothing to check. Thinking is the caller's choice (--thinking), off by
+    # default, so the prompt's own budget goes to the text that is graded.
     body = {"model": model, "temperature": spec["temperature"], "max_tokens": max_tokens,
-            "seed": seed, "messages": [{"role": "user", "content": spec["prompt"]}]}
+            "seed": seed, "enable_thinking": THINKING,
+            "messages": [{"role": "user", "content": spec["prompt"]}]}
     t0 = time.perf_counter()
     d = post(base, "/v1/chat/completions", body)
     wall = time.perf_counter() - t0
     if "error" in d:
         return dict(name=spec["name"], ok=False, failures=[f"API error: {d['error']}"], text="")
+    if not (d["choices"][0]["message"]["content"] or "") and max_tokens < 4096:
+        # Reasoning is billed against the same cap: a model that thinks the whole budget through
+        # returns an empty content with a non-zero completion count. Retry once with room for both.
+        body["max_tokens"] = max_tokens * 2
+        t0 = time.perf_counter()
+        d = post(base, "/v1/chat/completions", body)
+        wall = time.perf_counter() - t0
+        if "error" in d:
+            return dict(name=spec["name"], ok=False, failures=[f"API error: {d['error']}"], text="")
     ch = d["choices"][0]
     text = ch["message"]["content"] or ""
     st = d.get("x_engine_stats") or {}
@@ -185,7 +202,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--only", default="")
     ap.add_argument("--json", default="")
+    ap.add_argument("--thinking", action="store_true",
+                    help="leave the model's thinking on (default off: the gate scores the answer)")
     a = ap.parse_args()
+    global THINKING
+    THINKING = a.thinking
 
     want = {s.strip() for s in a.only.split(",") if s.strip()}
     specs = [s for s in PROMPTS if not want or s["name"] in want]

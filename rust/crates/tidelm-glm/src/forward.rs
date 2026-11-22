@@ -614,7 +614,11 @@ impl Engine {
         let mtp_arena = if cfg.mtp {
             let l = cfg.mtp_layer();
             let items: Vec<(usize, usize)> = (0..e).map(|x| (l, x)).collect();
-            let (a, so) = class_arena(&pack, &items, None, world, cfg.hidden, cfg.moe_inter)?;
+            let (mut a, so) = class_arena(&pack, &items, None, world, cfg.hidden, cfg.moe_inter)?;
+            // prefill rows through the fat tile as the decoder's (prefill-pg): the grouped GEMV took
+            // ~35 ms a 2,048-row block here, 0.35 s of an 8K prefill, for a layer that only fills
+            // the drafter's cache. TIDELM_GLM_MTP_FAT=0: the grouped GEMV as before.
+            a.prefill_tiled = std::env::var("TIDELM_GLM_MTP_FAT").as_deref() != Ok("0");
             load_slots(&pack, &a, &items.iter().zip(&so).map(|(&(l, x), &s)| (s, l, x)).collect::<Vec<_>>())?;
             let mut lut = vec![0i32; e];
             for (x, &s) in so.iter().enumerate() {

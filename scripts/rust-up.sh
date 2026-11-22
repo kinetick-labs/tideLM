@@ -140,6 +140,9 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
           --adapt-decode "${GLM_ADAPT_DECODE_SWAPS:-256}" --bg-every "$bg" --loop-break "${GLM_LOOP_BREAK:-0}"
           --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}"
           --preload "${GLM_PRELOAD:-0}")
+    # GLM_MOE_ROWS: prefill rows a routed-expert block (the scratch is sized for it; unset: the
+    # engine's 2048). 4096 fills the fat tile's 64-member groups twice as full (docs/prefill-pg.md)
+    [[ -n "${GLM_MOE_ROWS:-}" ]] && args+=(--moe-rows "$GLM_MOE_ROWS")
     # GLM_HOT_PREDICT=DECAY,MIN,PER_LAYER[,REACT]: async hot reads chosen by recent missed demand,
     # REACT=1 after the engine's own heaviest-miss candidates (unset: off; adapt.rs HotPredict)
     [[ -n "${GLM_HOT_PREDICT:-}" ]] && args+=(--hot-predict "$GLM_HOT_PREDICT")
@@ -343,7 +346,7 @@ fi
 # TIDELM_GLM_HOT_TRACE: GLM, rank 0 appends every decode pass's routing table and async hot reads to
 # this path (in a mounted directory), for tools/glm_hot_sim.py
 for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG TIDELM_PDL \
-         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT TIDELM_GLM_HOT_TRACE TIDELM_GLM_VERIFY_PLAN TIDELM_GLM_ACT_PLAN TIDELM_GLM_PREFILL_CHECK TIDELM_GLM_HOT_ORACLE TIDELM_FLASH_HC_FUSED TIDELM_FLASH_PF TIDELM_FLASH_PF_O TIDELM_FLASH_PF_SH TIDELM_GLM_STAGE_LOG; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT TIDELM_GLM_HOT_TRACE TIDELM_GLM_VERIFY_PLAN TIDELM_GLM_ACT_PLAN TIDELM_GLM_PREFILL_CHECK TIDELM_GLM_HOT_ORACLE TIDELM_FLASH_HC_FUSED TIDELM_FLASH_PF TIDELM_FLASH_PF_O TIDELM_FLASH_PF_SH TIDELM_GLM_STAGE_LOG TIDELM_GLM_MTP_FAT EXL3_ROT4; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done

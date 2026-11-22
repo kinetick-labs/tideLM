@@ -1618,6 +1618,96 @@ __global__ void dense_out_kernel(const float* __restrict__ Z, const half* __rest
     }
 }
 
+// Prefill-width forms of rot_in / dense_rot / dense_out (prefill-pg): the same arithmetic, op for op
+// (bit for bit), four programs a 128-thread block instead of one a 32-thread block, and each lane's
+// four elements moved as one 8-byte (16-byte for fp32) access instead of four 2-byte ones. The
+// one-warp blocks capped an SM at 32 resident warps and the scalar accesses at ~145 GB/s on GB10
+// (an 8K prefill spent 1.5 s in these three). Launched only when every pointer and stride is
+// aligned for the wide accesses (the launchers check; otherwise the kernels above run).
+constexpr int ROT_WARPS = 4;
+template <typename T> struct Vec4;
+template <> struct Vec4<half> { using U = uint2; };
+template <> struct Vec4<__nv_bfloat16> { using U = uint2; };
+template <typename T>
+__device__ __forceinline__ void ld4f(const T* p, float (&v)[4]) {
+    const uint2 u = *reinterpret_cast<const uint2*>(p);
+    const T* e = reinterpret_cast<const T*>(&u);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = to_f<T>(e[j]);
+}
+__device__ __forceinline__ void st4h(half* p, const float (&v)[4]) {
+    uint2 u;
+    half* e = reinterpret_cast<half*>(&u);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) e[j] = __float2half_rn(v[j] * HAD_SCALE);
+    *reinterpret_cast<uint2*>(p) = u;
+}
+
+template <typename TIN>
+__global__ void __launch_bounds__(ROT_WARPS * 32) rot_in4_kernel(const TIN* __restrict__ x, int x_stride,
+        const int* __restrict__ pick, const half* __restrict__ suh0, const half* __restrict__ suh1,
+        half* __restrict__ out0, half* __restrict__ out1, int K, int slots, int P) {
+    pdl_enter();
+    const int p = blockIdx.x * ROT_WARPS + (threadIdx.x >> 5), blk = blockIdx.y, mat = blockIdx.z;
+    if (p >= P) return;
+    const int row = p / slots;
+    const int e = pick[p];
+    if (e < 0) return;
+    const int lane = threadIdx.x & 31;
+    float v[4], s[4];
+    ld4f<TIN>(x + (size_t)row * x_stride + blk * 128 + 4 * lane, v);
+    ld4f<half>((mat ? suh1 : suh0) + (size_t)e * K + blk * 128 + 4 * lane, s);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = v[j] * s[j];
+    fwht128(v, lane);
+    st4h((mat ? out1 : out0) + (size_t)p * K + blk * 128 + 4 * lane, v);
+}
+
+template <typename TIN>
+__global__ void __launch_bounds__(ROT_WARPS * 32) dense_rot4_kernel(const TIN* __restrict__ x, int x_stride,
+        const half* __restrict__ suh, half* __restrict__ out, int K, int G, int R) {
+    pdl_enter();
+    const int r = blockIdx.x * ROT_WARPS + (threadIdx.x >> 5), blk = blockIdx.y, lane = threadIdx.x & 31;
+    if (r >= R) return;
+    float v[4], s[4];
+    ld4f<TIN>(x + (size_t)r * x_stride + blk * 128 + 4 * lane, v);
+    ld4f<half>(suh + (size_t)(r % G) * K + blk * 128 + 4 * lane, s);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = v[j] * s[j];
+    fwht128(v, lane);
+    st4h(out + (size_t)r * K + blk * 128 + 4 * lane, v);
+}
+
+__global__ void __launch_bounds__(ROT_WARPS * 32) dense_out4_kernel(const float* __restrict__ Z,
+        const half* __restrict__ svh, void* __restrict__ out, int rows, int N, int SK, int G, int out_bf16,
+        int out_stride) {
+    const size_t ldy = out_stride ? (size_t)out_stride : (size_t)N;
+    pdl_enter();
+    const int r = blockIdx.x * ROT_WARPS + (threadIdx.x >> 5), blk = blockIdx.y, lane = threadIdx.x & 31;
+    if (r >= rows) return;
+    const int n = blk * 128 + 4 * lane;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int q = 0; q < SK; ++q) {
+        const float4 z = *reinterpret_cast<const float4*>(Z + ((size_t)q * rows + r) * N + n);
+        v[0] += z.x; v[1] += z.y; v[2] += z.z; v[3] += z.w;
+    }
+    fwht128(v, lane);
+    float sv[4];
+    ld4f<half>(svh + (size_t)(r % G) * N + n, sv);
+    if (out_bf16) {
+        uint2 u;
+        __nv_bfloat16* e = reinterpret_cast<__nv_bfloat16*>(&u);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) e[j] = __float2bfloat16_rn(v[j] * HAD_SCALE * sv[j]);
+        *reinterpret_cast<uint2*>(reinterpret_cast<__nv_bfloat16*>(out) + r * ldy + n) = u;
+    } else {
+        float4 y;
+        y.x = v[0] * HAD_SCALE * sv[0]; y.y = v[1] * HAD_SCALE * sv[1];
+        y.z = v[2] * HAD_SCALE * sv[2]; y.w = v[3] * HAD_SCALE * sv[3];
+        *reinterpret_cast<float4*>(reinterpret_cast<float*>(out) + r * ldy + n) = y;
+    }
+}
+
 // down_epilogue then combine in one launch: rotate * svh_d, then sum over the top-k slots in order.
 __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                     const half* __restrict__ svh_d,
@@ -1819,8 +1909,29 @@ void exl3m_group(const int* pick, int* uids, int* ucount, int* members, int R, i
     pdl_launch(exl3::group_small_kernel, 1, 64, 0, s, pick, uids, ucount, members, P, slots, maxm);
 }
 
+static inline bool al8(const void* p) { return ((uintptr_t)p & 7) == 0; }
+static inline bool al16(const void* p) { return ((uintptr_t)p & 15) == 0; }
+// prefill-pg's wide forms (rot_in4 / dense_rot4 / dense_out4): on unless EXL3_ROT4=0, and only where
+// the accesses are aligned. Read once.
+static bool rot4_on() {
+    static int on = -1;
+    if (on < 0) { const char* v = getenv("EXL3_ROT4"); on = !(v && v[0] == '0'); }
+    return on == 1;
+}
+
 void exl3m_rot_in(const void* x, int x_stride, const int* pick, const void* suh0, const void* suh1, void* out0,
                   void* out1, int rows, int K, int slots, int E, int x_bf16, cudaStream_t s) {
+    const int P = rows * slots;
+    if (rot4_on() && P > 64 && al8(x) && x_stride % 4 == 0 && al8(suh0) && al8(suh1) && al8(out0) && al8(out1) && K % 128 == 0) {
+        dim3 grid4((unsigned)((P + exl3::ROT_WARPS - 1) / exl3::ROT_WARPS), (unsigned)(K / 128), 2);
+        if (x_bf16)
+            pdl_launch(exl3::rot_in4_kernel<__nv_bfloat16>, grid4, exl3::ROT_WARPS * 32, 0, s, (const __nv_bfloat16*)x, x_stride,
+                       pick, (const half*)suh0, (const half*)suh1, (half*)out0, (half*)out1, K, slots, P);
+        else
+            pdl_launch(exl3::rot_in4_kernel<half>, grid4, exl3::ROT_WARPS * 32, 0, s, (const half*)x, x_stride, pick,
+                       (const half*)suh0, (const half*)suh1, (half*)out0, (half*)out1, K, slots, P);
+        return;
+    }
     dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
     if (x_bf16)
         pdl_launch(exl3::rot_in_kernel<__nv_bfloat16>, grid, 32, 0, s, (const __nv_bfloat16*)x, x_stride, pick,
@@ -1972,6 +2083,16 @@ void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void
 
 void exl3m_dense_rot(const void* x, int x_stride, const void* suh, void* out, int rows, int K, int G, int x_bf16,
                      cudaStream_t s) {
+    if (rot4_on() && rows > 16 && al8(x) && x_stride % 4 == 0 && al8(suh) && al8(out) && K % 128 == 0) {
+        dim3 grid4((unsigned)((rows + exl3::ROT_WARPS - 1) / exl3::ROT_WARPS), (unsigned)(K / 128));
+        if (x_bf16)
+            pdl_launch(exl3::dense_rot4_kernel<__nv_bfloat16>, grid4, exl3::ROT_WARPS * 32, 0, s, (const __nv_bfloat16*)x,
+                       x_stride, (const half*)suh, (half*)out, K, G, rows);
+        else
+            pdl_launch(exl3::dense_rot4_kernel<half>, grid4, exl3::ROT_WARPS * 32, 0, s, (const half*)x, x_stride,
+                       (const half*)suh, (half*)out, K, G, rows);
+        return;
+    }
     dim3 grid((unsigned)rows, (unsigned)(K / 128));
     if (x_bf16)
         pdl_launch(exl3::dense_rot_kernel<__nv_bfloat16>, grid, 32, 0, s, (const __nv_bfloat16*)x, x_stride,
@@ -1996,6 +2117,13 @@ void exl3m_rot_in_shared(const void* x, int x_stride, const int* pick, const voi
 
 void exl3m_dense_out(const float* Z, const void* svh, void* out, int rows, int N, int SK, int G, int out_bf16,
                      int out_stride, cudaStream_t s) {
+    if (rot4_on() && rows > 16 && al16(Z) && al8(svh) && (out_bf16 ? al8(out) : al16(out)) && out_stride % 4 == 0 &&
+        N % 128 == 0) {
+        dim3 grid4((unsigned)((rows + exl3::ROT_WARPS - 1) / exl3::ROT_WARPS), (unsigned)(N / 128));
+        pdl_launch(exl3::dense_out4_kernel, grid4, exl3::ROT_WARPS * 32, 0, s, Z, (const half*)svh, out, rows, N, SK, G,
+                   out_bf16, out_stride);
+        return;
+    }
     dim3 grid((unsigned)rows, (unsigned)(N / 128));
     pdl_launch(exl3::dense_out_kernel, grid, 32, 0, s, Z, (const half*)svh, out, rows, N, SK, G, out_bf16, out_stride);
 }

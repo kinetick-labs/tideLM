@@ -35,6 +35,9 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 use tidelm_cuda::DeviceBuffer;
 use tidelm_kernels::dflash::{D, KVW};
 
+mod plan;
+pub use plan::{block_ids, block_positions, context_from, MASK};
+
 
 
 /// Positions a draft block carries: `BLOCK` from the checkpoint (`block_size: 8`).
@@ -179,10 +182,14 @@ impl Drafter {
 // sequence and the checkpoint's tensor list); the kernels are `tidelm-kernels/cuda/dflash.cu` and
 // the linears are the crate's bf16 GEMM, since the drafter is served in bf16.
 //
-// A block is `streams * BLOCK` rows: 8 positions a stream, position 0 the anchor (the last token
-// the target accepted) and 1..8 the mask token. The pass ends with `norm`, the block's hidden
-// `hn` and the selector's 256-wide projection `g`; the head that turns `hn` into logits is the
-// *target's* (the checkpoint has no `lm_head`), so it is called by the caller that owns it.
+// A block is `streams * BLOCK` rows. TensorFold's `Drafter.draft` fills row 0 with the anchor's
+// embedding and rows 1..7 with the mask token's, then runs the five layers from that residual.
+// The taps do not enter here: `ingest_until` projects them into the ring (`fc`, hidden norm, each
+// layer's `kv`) before the block is embedded, which is `ingestPass`, a different call. The pass
+// ends with `norm`, the block's hidden `hn` and the selector's projection `g` in fp32 (TensorFold's
+// `linB(..., wide: true)`: the walk multiplies it by a bf16 codebook row). The head that turns
+// `hn` into logits is the *target's* (the checkpoint has no `lm_head`), so the caller that owns
+// the head runs it and passes the fp32 logits to `candidates_bf16`.
 //
 // The conv nesting is the part to read twice: each layer normalises, projects the dynamic
 // weights, convolves the *normalised input* with which = 0, projects, and after the projection
@@ -193,7 +200,7 @@ use std::os::raw::c_void;
 
 use tidelm_cuda::Stream;
 
-use tidelm_kernels::blas::{Blas, Mat, R_16BF};
+use tidelm_kernels::blas::{Blas, Mat, R_16BF, R_32F};
 use tidelm_kernels::dflash as k;
 use tidelm_kernels::glm;
 
@@ -233,7 +240,9 @@ pub struct Run {
     pub gu: DeviceBuffer<u16>,
     pub act: DeviceBuffer<u16>,
     pub hn: DeviceBuffer<u16>,
-    pub g: DeviceBuffer<u16>,
+    /// `[rows][256]` fp32. TensorFold's selector multiplies this by a bf16 codebook row; storing it
+    /// in bf16 quantises the vector first.
+    pub g: DeviceBuffer<f32>,
     /// The chunked attention's partials: max and sum `[M][QH][CH]`, accumulators `[M][QH][CH][HD]`.
     pub pm: DeviceBuffer<f32>,
     pub pl: DeviceBuffer<f32>,
@@ -506,7 +515,10 @@ impl Run {
             glm::glm_rmsnorm(sr, np(&self.x), d as i64, std::ptr::null(), 0, np(&dr.norm), np(&self.hn), d as i64,
                              m as i32, d as i32, EPS);
         }
-        self.gemm(blas, &self.hn, &dr.hproj, RANK, d, &self.g)
+        // fp32, matching TensorFold's wide projection. The walk reads `g` as f32.
+        blas.gemm_rm(self.rows, RANK, d, Mat { ptr: self.hn.raw(), ty: R_16BF, ld: d as i64 },
+                     Mat { ptr: dr.hproj.raw(), ty: R_16BF, ld: d as i64 }, true, self.g.raw(), R_32F, RANK as i64)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
     }
 
     /// With `DF_DUMP=1`, each intermediate's hash after the kernels of layer 0: two passes whose
@@ -549,6 +561,9 @@ impl Run {
 /// the drafts come back.
 pub struct Block {
     pub run: Run,
+    /// The block's token ids, `[rows]`: row 0 the anchor, rows 1..7 the mask. Embedded into `run.x`
+    /// before `pass`.
+    pub ids: DeviceBuffer<i32>,
     pub pv: DeviceBuffer<f32>,
     pub pi: DeviceBuffer<i32>,
     /// `[rows][2][16]`: ids then the values as f32 bits, as `top16_merge` writes them.
@@ -557,6 +572,16 @@ pub struct Block {
     pub chain: DeviceBuffer<i32>,
     /// `[BLOCK - 1][streams]`: which row each step reads its candidates from.
     pub rsel: DeviceBuffer<i32>,
+    /// Scratch for the context ingest, sized to the window so one prompt is a handful of GEMMs
+    /// rather than one per block of 8. The block's own buffers stay 8 rows: a pass over the
+    /// window would be 256 streams.
+    ingest_y: DeviceBuffer<u16>,
+    ingest_x: DeviceBuffer<u16>,
+    ingest_qkv: DeviceBuffer<u16>,
+    ingest_bpos: DeviceBuffer<i32>,
+    ingest_rings: DeviceBuffer<u64>,
+    /// Exclusive end of the positions the ring already holds. 0 until the first ingest.
+    pub ctx_until: std::sync::atomic::AtomicI64,
     pub chunks: usize,
     /// Last position the window was seeded at. The seed costs a drafter pass over the window; it
     /// grows by a token or three a round, so re-seeding every 64 positions is enough to keep it
@@ -567,6 +592,12 @@ pub struct Block {
 
 impl Block {
     pub fn new(dr: &Drafter, rows: usize) -> Result<Self> {
+        // The host plan and the kernels name the window and the block independently. A drift here
+        // is a ring written at one modulus and read at another, and the two ranks of a pair would
+        // not be what diverges -- one process would, silently.
+        if plan::WIN != k::WIN || plan::BLOCK != k::BLOCK {
+            return Err(format!("dflash plan geometry {}x{} drifted from the kernels {}x{}", plan::WIN, plan::BLOCK, k::WIN, k::BLOCK).into());
+        }
         let streams = rows / BLOCK;
         let chunks = VOCAB.div_ceil(4096);
         let mut rsel = Vec::with_capacity((BLOCK - 1) * streams);
@@ -575,26 +606,122 @@ impl Block {
                 rsel.push((s * BLOCK + step) as i32);
             }
         }
+        let w = k::WIN;
         Ok(Self {
             run: Run::new(dr, rows)?,
+            ids: DeviceBuffer::zeroed(rows)?,
             pv: DeviceBuffer::zeroed(rows * chunks * 16)?,
             pi: DeviceBuffer::zeroed(rows * chunks * 16)?,
             cand: DeviceBuffer::zeroed(rows * 2 * 16)?,
             chain: DeviceBuffer::zeroed(BLOCK * streams)?,
             rsel: DeviceBuffer::from_slice(&rsel)?,
+            // One window, not 256 passes of 8. y and x are 16 MB each, qkv 8 MB: allocated with the
+            // drafter, never in a round. Measured against the alternative only as a count of
+            // launches (256 skinny GEMMs of 8x4096x20480 against two of the window).
+            ingest_y: DeviceBuffer::zeroed(w * k::D)?,
+            ingest_x: DeviceBuffer::zeroed(w * k::D)?,
+            ingest_qkv: DeviceBuffer::zeroed(w * 2 * k::KVW)?,
+            ingest_bpos: DeviceBuffer::zeroed(w)?,
+            ingest_rings: DeviceBuffer::zeroed(w / BLOCK)?,
+            ctx_until: std::sync::atomic::AtomicI64::new(0),
             chunks,
             seeded_to: std::sync::atomic::AtomicI64::new(-1),
             streams,
         })
     }
 
-    /// Fill the ring from the tap rows themselves: each tapped layer's hidden projected through
-    /// that layer's `k|v` and written at the row's position, which is `ctx_kv`'s job.
+    /// Project the captured residuals of `[ingest_lo, anchor_pos)` into the ring the block's
+    /// attention reads, and return `context_from(anchor_pos)` for the attention window.
     ///
-    /// This is the *short* seed: `BLOCK` keys, the rows the taps hold. TensorFold seeds `WIN`
-    /// (2048) keys by running the drafter's own context over the prompt's tail, which needs the
-    /// last 2048 rows' residual at those five layers kept from prefill -- the next piece, and the
-    /// reason a draft's acceptance will read low until it exists.
+    /// This is TensorFold's `ingestPass`: `fc` over the five taps, the hidden norm, then each
+    /// layer's `kv` into `ctx_kv` at the row's real position. One GEMM a slice. A slice is at most
+    /// the window, and a window that wraps the capture is two slices (`plan::win_slices`).
+    pub fn ingest_until(&self, st: &Stream, blas: &Blas, dr: &Drafter, anchor_pos: i64) -> Result<i64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let until = plan::resume_until(self.ctx_until.load(Relaxed), anchor_pos);
+        self.ctx_until.store(until, Relaxed);
+        let lo = plan::ingest_lo(until, anchor_pos);
+        let ring = self.run.ring.raw() as u64;
+        let ptrs = vec![ring; k::WIN / BLOCK];
+        self.ingest_rings.upload_async(0, &ptrs, st)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+        for s in plan::win_slices(lo, anchor_pos) {
+            self.ingest_slice(st, blas, dr, s)?;
+        }
+        self.ctx_until.store(anchor_pos, Relaxed);
+        Ok(plan::context_from(anchor_pos))
+    }
+
+    fn ingest_slice(&self, st: &Stream, blas: &Blas, dr: &Drafter, s: plan::WinSlice) -> Result<()> {
+        let n = s.n;
+        if n == 0 {
+            return Ok(());
+        }
+        if n > k::WIN {
+            return Err(format!("dflash ingest: {n} rows, the scratch holds {}", k::WIN).into());
+        }
+        let d = k::D;
+        let x = self.run.win.ptr_at(s.phys * 5 * d);
+        let gemm = |m: usize, nn: usize, kk: usize, xp: *mut c_void, w: *mut c_void, y: *mut c_void, ldy: usize| -> Result<()> {
+            blas.gemm_rm(m, nn, kk, Mat { ptr: xp, ty: R_16BF, ld: kk as i64 },
+                         Mat { ptr: w, ty: R_16BF, ld: kk as i64 }, true, y, R_16BF, ldy as i64)
+                .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+        };
+        // y = rmsnorm(fc(taps)). fc is [D][5D]; the slice is contiguous in the capture, so the
+        // leading dimension is 5D even when the slice starts mid-ring.
+        gemm(n, d, 5 * d, x, dr.fc.raw(), self.ingest_y.raw(), d)?;
+        unsafe {
+            glm::glm_rmsnorm(st.raw(), self.ingest_y.raw(), d as i64, std::ptr::null(), 0, np(&dr.hnorm),
+                             self.ingest_x.raw(), d as i64, n as i32, d as i32, EPS);
+        }
+        let pos: Vec<i32> = (0..n).map(|i| (s.pos0 + i as i64) as i32).collect();
+        self.ingest_bpos.upload_async(0, &pos, st)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+        for (li, l) in dr.layers.iter().enumerate() {
+            gemm(n, 2 * k::KVW, d, self.ingest_x.raw(), l.kv.raw(), self.ingest_qkv.raw(), 2 * k::KVW)?;
+            // every group points at the one ring the block reads (uploaded above)
+            ck(unsafe {
+                k::glm_df_launch_ctx_kv(st.raw(), self.ingest_qkv.raw(), np(&l.kn), self.ingest_bpos.raw(),
+                                        self.ingest_rings.raw(), li as i32, n as i32, EPS, THETA)
+            }, "ctx_kv ingest")?;
+        }
+        Ok(())
+    }
+
+    /// The block's tables for one stream whose anchor sits at `anchor_pos` and whose context starts
+    /// at `from`. Attention's position for row t is `starts + t`; RoPE's is `bpos[t]`. They are the
+    /// same number here. The previous port set starts one past bpos so the two disagreed by a token.
+    pub fn arm(&self, st: &Stream, anchor_pos: i64, from: i64) -> Result<()> {
+        if self.streams != 1 || self.run.rows != BLOCK {
+            return Err("dflash arm is one stream of one block; a second stream shares the ring".into());
+        }
+        let bpos = plan::block_positions(anchor_pos);
+        let seed = [0i64; BLOCK];
+        self.run.set_tables(st, &[anchor_pos], &[from], &bpos, &seed)
+    }
+
+    /// Row 0 is the anchor's embedding, rows 1..7 the mask token's, one copy (the drafter has no
+    /// mHC streams). `pos` is null: the MTP embed zeros a row whose position is 0, and a block can
+    /// sit at position 0.
+    pub fn embed_block(&self, st: &Stream, anchor: i32, mask: i32, table: *const c_void, h: usize) -> Result<()> {
+        if h != k::D {
+            return Err(format!("dflash embed: hidden {h}, the block is {}", k::D).into());
+        }
+        if self.run.rows != BLOCK {
+            return Err("dflash embed: the block is not BLOCK rows".into());
+        }
+        let ids = plan::block_ids(anchor, mask);
+        self.ids.upload_async(0, &ids, st)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+        ck(unsafe {
+            tidelm_kernels::flash::flash_embed(st.raw(), self.ids.raw(), BLOCK as i32, table, h as i32, 1,
+                                               std::ptr::null(), self.run.x.raw())
+        }, "embed block")
+    }
+
+    /// Not on the serving path. Projects each tap slot through that layer's `kv` with no `fc` and no
+    /// hidden norm, which is not `ingestPass`. `ingest_until` is. Left so the short-seed measurement
+    /// (accept 1.64, eight keys, dead head) can be reproduced.
     pub fn seed_taps(&self, st: &Stream, blas: &Blas, dr: &Drafter) -> Result<()> {
         let (m, d) = (self.run.rows, k::D);
         for (li, l) in dr.layers.iter().enumerate() {
@@ -611,13 +738,11 @@ impl Block {
         Ok(())
     }
 
-    /// Seed the drafter's ring from the captured window: every BLOCK rows of the sequence's tail gets
-    /// its own pass over the block's ring, in position order, so the keys the next attention looks up
-    /// are the prompt's own state and not the eight rows of the verify step.
-    ///
-    /// Groups of BLOCK, not one wide pass: the block kernels give a ring a stream and a stream BLOCK
-    /// rows, so a 512-row pass would allocate 64 rings (2,5 GiB). This way nothing is allocated at
-    /// all -- the run and its ring already exist -- and the cost is a drafter pass a BLOCK rows.
+    /// Kept, not called. This seeded the ring from the block's own `qkv` after a full `pass` of the
+    /// tap rows, which is not `ingestPass` (that projects `kv(rmsnorm(fc(taps)))`). The campaign
+    /// measured it: a window seeded this way accepted 1.48-1.70, the same band as eight keys, and
+    /// both were scoring the previous forward's logits (docs/dflash2-campaign.md). `ingest_until`
+    /// is the path the server takes.
     pub fn seed_window(&self, st: &Stream, blas: &Blas, dr: &Drafter, p0: i64) -> Result<usize> {
         use std::sync::atomic::Ordering::Relaxed;
         let captured = self.run.win_rows.load(Relaxed) as i64;
@@ -658,26 +783,30 @@ impl Block {
     /// `act.logits` (`glm_argmax_bf16` reads the same buffer). Same chunked top-16, same layout.
     /// The target's head logits ([rows][vocab], f32 -- tidelm-glm's `act.head`) into the block's
     /// candidates. The f32 variant of the kernel already existed: no cast, no copy.
-    pub fn candidates_bf16(&self, st: &Stream, logits: *const c_void, vocab: usize) -> Result<()> {
+    pub fn candidates_bf16(&self, st: &Stream, logits: *const c_void, vocab: usize, offset: usize) -> Result<()> {
+        let chunks = vocab.div_ceil(4096);
+        if chunks > self.chunks || offset.saturating_add(vocab) > VOCAB {
+            return Err(format!("dflash top16: offset {offset} + {vocab} ({chunks} chunks) past the codebooks' {VOCAB}").into());
+        }
         ck(unsafe {
-            k::glm_df_launch_top16_part_f32(st.raw(), logits, self.run.rows as i32, vocab as i32, 0,
+            k::glm_df_launch_top16_part_f32(st.raw(), logits, self.run.rows as i32, vocab as i32, offset as i32,
                                             np(&self.pv), np(&self.pi))
         }, "top16 part f32")?;
         // The part kernel grids over the width it is given (vl, the target's head), while pv/pi are
         // sized on the checkpoint's VOCAB: merging `self.chunks` here read 32 never-written slots
         // per row -- value 0.0, id 0 -- and 0.0 beats every negative logit, so id 0 was a candidate
         // on every row. Merge exactly as many chunks as were written.
-        let chunks = vocab.div_ceil(4096);
-        if vocab > VOCAB {
-            return Err(format!("dflash top16: {vocab} wide, the codebooks hold {VOCAB}").into());
-        }
         ck(unsafe {
             k::glm_df_launch_top16_merge(st.raw(), np(&self.pv), np(&self.pi), self.run.rows as i32, chunks as i32,
                                          np(&self.cand))
         }, "top16 merge")
     }
 
-    /// `round` over bf16 logits (the engine's own buffer).
+    /// The path the server used through the campaign, kept so the measurement stays reproducible.
+    /// It starts the block from `rmsnorm(fc(taps))` and scores whatever logits the caller passes.
+    /// Serving passed the previous forward's `act.head`, whose unwritten rows tie-break to ids
+    /// 0..15 (`docs/dflash2-campaign.md`: drafts `8, 0, 13, 4, 8, 0, 0`, accept 1.04). The server
+    /// now embeds the anchor and the mask and scores `lm_head` of this pass's `hn`.
     pub fn round_bf16(&self, st: &Stream, blas: &Blas, dr: &Drafter, logits: *const c_void, anchors: &[i32],
                       vocab: usize) -> Result<Vec<i32>> {
         if anchors.len() != self.streams {
@@ -685,7 +814,7 @@ impl Block {
         }
         self.run.embed_taps(st, blas, dr)?;
         self.run.pass(st, blas, dr)?;
-        self.candidates_bf16(st, logits, vocab)?;
+        self.candidates_bf16(st, logits, vocab, 0)?;
         self.anchor(st, anchors)?;
         self.walk(st, dr)?;
         self.drafts(st)

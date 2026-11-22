@@ -1209,24 +1209,20 @@ impl Server {
         // rather than inside it: DSpark drafts for Inkling 2, this for GLM-5.3-Flash, and the
         // verification that follows is the same code.
         if self.eng.dflash.is_some() {
-            for k in 0..blocks.len() {
-                if blocks[k].plain || blocks[k].copy {
-                    continue;
+            // The anchor occupies position `b.p`: it was sampled and not yet written, and the
+            // verify forward that follows starts there. Context is everything before it. One
+            // capture and one ring, so two drafting lanes would alias `p % WIN`.
+            let want: Vec<usize> = blocks.iter().enumerate().filter(|(_, b)| !b.plain && !b.copy).map(|(k, _)| k).collect();
+            if want.len() > 1 {
+                if let Some(df) = self.eng.dflash.as_ref() {
+                    if !df.multi.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("dflash: {} lanes in one round share one ring; drafting none of them", want.len());
+                    }
                 }
-                let p0 = blocks[k].p as i64 + 1;
-                // The taps hold the residuals of the rows the last pass ran, i.e. positions
-                // p0-1 .. p0+BLOCK-2 -- so the block's row i is at p0-1+i, not p0+i. Declaring the
-                // latter rotated every row a token ahead of its own content: a systematic
-                // off-by-one in both the RoPE and the walker's per-step row, which reads exactly
-                // like a drafter that never guesses right.
-                let bpos: Vec<i64> = (0..tidelm_dflash::BLOCK as i64).map(|i| p0 - 1 + i).collect();
-                // The short seed covers the BLOCK positions before the anchor, which is the window
-                // attention reads. `from` is the first of them: any earlier position in the ring
-                // was never written by this sequence.
-                let bseed: Vec<i64> = (0..tidelm_dflash::BLOCK as i64).map(|i| p0 - tidelm_dflash::BLOCK as i64 + i).collect();
-                let from = bseed[0].max(0);
+            } else if let Some(&k) = want.first() {
+                let anchor_pos = blocks[k].p as i64;
                 let anchor = runs[blocks[k].i].anchor as i32;
-                let picks = self.eng.dflash_drafts(&[p0], &[from], &bpos, &bseed, &[anchor])?;
+                let picks = self.eng.dflash_drafts(anchor_pos, anchor)?;
                 let dmax = blocks[k].dmax;
                 blocks[k].drafts = picks.into_iter().take(dmax).map(|d| d as u32).collect();
                 blocks[k].qs = vec![None; blocks[k].drafts.len()];
@@ -1472,7 +1468,6 @@ impl Server {
                 st.rounds += 1;
                 st.drafted += nd;
                 st.accepted += n_acc;
-                self.eng.note_dflash(n_acc);
                 if b.long {
                     st.long_copies += 1;
                 }
@@ -1483,6 +1478,12 @@ impl Server {
             }
             r.g.accepted.push(n_acc);
             r.g.depths.push(nd);
+            // Once a round, not once per stats mirror: the loop above visits the engine and the
+            // lane, and counting both stood the drafter down in four misses. A copy's misses are
+            // not the drafter's either.
+            if self.eng.dflash.is_some() && !b.copy && !b.drafts.is_empty() {
+                self.eng.note_dflash(n_acc);
+            }
             if b.long {
                 r.copier.as_mut().unwrap().observe(n_acc);
             }

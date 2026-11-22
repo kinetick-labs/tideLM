@@ -130,7 +130,8 @@ fn main() -> Result<()> {
         }
     }
     println!("hn: {finite}/{} finite, {zeros} exact zeros, range [{lo:.4}, {hi:.4}]", hn.len());
-    let gfin = g.iter().filter(|&&x| hf(x).is_finite()).count();
+    // g is fp32 (the selector multiplies it by a bf16 codebook row; a bf16 store quantises first).
+    let gfin = g.iter().filter(|x| x.is_finite()).count();
     println!("g (selector projection): {gfin}/{} finite", g.len());
     if finite != hn.len() || gfin != g.len() {
         return Err("the drafter's forward produced non-finite values".into());

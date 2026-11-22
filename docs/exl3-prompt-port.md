@@ -28,12 +28,36 @@ That is the good news — a port of the tiling has no numerical excuse to fail, 
 proved with `--bench-nll` (1.9250 / 1.6699 coding / 2.4146 general on `heldout_quick`, the number to
 hold) and `tools/generation_gate.py` (6/6).
 
-## What TensorFold's prompt arm does differently
+## Correction, 2026-11-22, against `rebase/1.3.1-glm53` (`4f08e84`)
+
+The kernel named above is not the one on the branch that produced the 1 269 tok/s. That branch
+has no `fn_exl3.cu` and no `pg_program`. The prompt arm is `tgateup` in
+`zig/kernels/cuda/exl3_prompt.cuh`: 256 threads (`TT = 8 * 32`), 64 members (`TPM`), 3 cp.async
+stages, gate and up in one launch (`tmain<2>`), a fused Hadamard plus SwiGLU epilogue that writes
+the down input, `blockIdx.x` the column block and `blockIdx.y` the item. fp16 `mma16816`.
+
+TideLM's `prefill_fat_kernel` is the same shape. 256 threads, 64 members (`FAT_MB * 16`), gate and
+up together (`NS = 2`), the same fused Hadamard and SwiGLU into `xd` (`fwht128` at the epilogue,
+not a second kernel), `blockIdx.y` the expert group and `blockIdx.x` the column block. The
+differences that are actually in the two files are the pipeline depth (3 against `FAT_STAGES = 4`)
+and where the two matrices sit: TensorFold gives four warps to gate and four to up, the fat tile
+keeps both in every warp's registers (`acc[NS][…]`).
+
+`TIDELM_GLM_FAT=0` was already measured, on an earlier prompt, at 18.29 → 15.82 s, so the fat tile
+is the faster of the two arrangements this tree has. Shipping a third tile from a description of
+`pg_program` would be porting a kernel the 1 269 number did not come from, and it cannot be timed
+here (no GPU, no nvcc). No prefill kernel changed with the DFlash2 fix. The length scaling is
+still the open question: TensorFold goes 901 → 1 269 tok/s from 6.8k to 27k tokens and TideLM
+stays near 700–770, which is a property of the whole prefill, not a line in `tgateup`. The A/B is
+`docs/spark-bench.md`.
+
+## What an older note said TensorFold's prompt arm did
 
 `pg_program<2, K2>` with a 128-thread block (4 warps), fed by a separate 1024-thread item list
 (`tf_exl3_prompt_items`): per expert, members are grouped in 64s, and the grid walks (item, column
-tile) so a block owns one 64-member group of one expert over one column tile. Against TideLM's fat
-tile:
+tile) so a block owns one 64-member group of one expert over one column tile. That table is the
+stale one, kept so the next port does not implement it. Against TideLM's fat tile, as that note
+had it:
 
 | | TensorFold `pg_program` | TideLM `prefill_fat_kernel` |
 |---|---|---|
@@ -51,6 +75,10 @@ matrix per launch and a narrower accumulator. Which of the two matters is not so
 on the real checkpoint.
 
 ## Order of work
+
+Not started. The list below is the plan for `pg_program`, and that kernel is not on the branch
+that measured 1 269 tok/s (see the correction above). Do not add `GLM_PREFILL_KERNEL=tfpg` on the
+strength of this list. The checks in steps 3 and 4 are still the ones a future tile has to pass.
 
 1. A `GLM_PREFILL_KERNEL=tfpg` arm beside the fat tile — a `prefill_pg_kernel` with TensorFold's
    mapping (4 warps, one 64-member group, one column tile per block, gate and up as separate

@@ -465,6 +465,9 @@ impl Engine {
         if self.hc_fused_for(t) {
             self.hc_site(l, 0, t, l > 0)?;
             if l > 0 {
+                // hc_site just closed layer l-1's MLP into the stream. Attention's post overwrites
+                // it, so the tap is here and not after the layer's own mlp.
+                self.dflash_tap_closed(l - 1, t)?;
                 self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(l - 1))?;
             } else {
                 self.dump("tok", np(&self.act.tok), t * 4, None)?;
@@ -475,6 +478,7 @@ impl Engine {
         }
         if l > 0 {
             self.hc_post(1, t)?;
+            self.dflash_tap_closed(l - 1, t)?;
             self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(l - 1))?;
         } else {
             self.dump("tok", np(&self.act.tok), t * 4, None)?;
@@ -502,6 +506,7 @@ impl Engine {
     /// hyper head), the final norm into hn.
     pub(crate) fn flash_final(&self, t: usize) -> Result<()> {
         self.hc_post(1, t)?;
+        self.dflash_tap_closed(self.cfg.layers - 1, t)?;
         self.dump(&format!("x{}", self.cfg.layers - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(self.cfg.layers - 1))?;
         let (a, fa) = (&self.act, &self.fl().act);
         let h = self.cfg.hidden;

@@ -531,11 +531,14 @@ extern "C" int glm_df_launch_top16_part_f32(cudaStream_t st, const void* logits,
 
 // The candidate selector, one block a stream. The chain is sequential -- the next step's
 // predecessor is this step's pick -- so this is one launch a step, over the streams' current row.
-// pg = predecessor_codebook[prev] * g over the ranks; each candidate scores its successor row,
-// value + pg . succ[id], and the winner is the draft.
+// pg = predecessor_codebook[prev] * g over the ranks. `g` is fp32: TensorFold's hidden projection
+// is the wide matmul (`linB(..., wide: true)` in dflash_block.zig) and the host selector multiplies
+// bf16(pred) by that f32. A bf16 g quantises the 256-vector before the dot, which moves a close
+// candidate. Each candidate scores its successor row, value + pg . succ[id], and the winner is the
+// draft (the token id, not the slot).
 extern "C" __global__ void __launch_bounds__(256) glm_df_select(const __nv_bfloat16* __restrict__ pred,
                                                                 const __nv_bfloat16* __restrict__ succ,
-                                                                const __nv_bfloat16* __restrict__ g,
+                                                                const float* __restrict__ g,
                                                                 const int* __restrict__ cand,
                                                                 const int* __restrict__ prev,
                                                                 const int* __restrict__ rsel, int* __restrict__ out,
@@ -543,9 +546,9 @@ extern "C" __global__ void __launch_bounds__(256) glm_df_select(const __nv_bfloa
     __shared__ float pg[256];
     __shared__ float sc[TOP];
     const int s = blockIdx.x, r = rsel[s], p = prev[s];
-    const __nv_bfloat16* gr = g + (long long)r * rank;
+    const float* gr = g + (long long)r * rank;
     const __nv_bfloat16* pr = pred + (long long)p * rank;
-    for (int c = threadIdx.x; c < rank; c += blockDim.x) pg[c] = bf(pr[c]) * bf(gr[c]);
+    for (int c = threadIdx.x; c < rank; c += blockDim.x) pg[c] = bf(pr[c]) * gr[c];
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
     for (int i = warp; i < TOP; i += nw) {
@@ -583,7 +586,7 @@ extern "C" int glm_df_launch_cast_bf16(cudaStream_t st, const void* src, void* d
 extern "C" int glm_df_launch_select(cudaStream_t st, const void* pred, const void* succ, const void* g, const void* cand,
                                     const void* prev, const void* rsel, void* out, int streams, int rank) {
     glm_df_select<<<dim3(streams), 256, 0, st>>>((const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,
-                                                (const __nv_bfloat16*)g, (const int*)cand, (const int*)prev,
+                                                (const float*)g, (const int*)cand, (const int*)prev,
                                                 (const int*)rsel, (int*)out, rank);
     return df_check();
 }

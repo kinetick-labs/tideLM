@@ -50,6 +50,10 @@ pub const VOCAB: usize = 154880;
 /// Rows a drafter call can carry: the verify block, which is what a round drafts for.
 pub const MAX_ROWS: usize = 8;
 
+/// The drafter's attention window, in keys. The seed reaches for 8 of them today (see
+/// `seed_taps`); the checkpoint was trained on the full window.
+pub const WIN: usize = tidelm_kernels::dflash::WIN;
+
 /// One layer's weights, laid out the way the kernels index them.
 pub struct DraftLayer {
     pub in_norm: DeviceBuffer<u16>,

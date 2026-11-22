@@ -4156,8 +4156,17 @@ impl Engine {
             return Err(format!("dflash draft: one lane at a time, got {}", reqs.len()).into());
         }
         let anchors: Vec<i32> = reqs.iter().map(|&(_, tok, _)| tok as i32).collect();
+        // The block's eight rows are the positions the target has not written yet: `last` is the
+        // token just accepted, so the drafts sit at last+1 ..= last+8. `froms` is the first key the
+        // drafter may read -- its own window edge, floored at the sequence start.
+        let p_last = reqs[0].2;
+        let p0 = p_last as i64 + 1;
+        let from = (p0 - (tidelm_dflash::WIN as i64 - 1)).max(0);
+        let bpos: Vec<i64> = (0..tidelm_dflash::BLOCK).map(|i| p0 + i as i64).collect();
         let (st, logits) = (&self.stream, self.act.logits.raw());
         let df = self.dflash.as_ref().expect("checked above");
+        df.blk.run.set_tables(st, &[p0], &[from], &bpos).map_err(|e| format!("dflash tables: {e}"))?;
+        df.blk.seed_taps(st, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
         let picks = df.blk.round_bf16(st, &df.blas, &df.dr, logits, &anchors).map_err(|e| format!("dflash: {e}"))?;
         // picks is [step][stream], step-major
         let mut out = vec![Vec::with_capacity(tidelm_dflash::BLOCK - 1); reqs.len()];

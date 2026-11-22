@@ -186,3 +186,27 @@ than it should, and the obvious explanation would be the obvious wrong one.
 The drafter therefore gets its own hook after `self.block(...)`, its own buffer, and the same
 `df_tap` mode 0 (the 4 streams' mean) -- which is the same buffer layout `main_h` already has
 (`[rows][5][D]`), so `ds_gather_rows_u16` gathers the block's 8 rows at draft time unchanged.
+
+## Open: the block pass is not deterministic yet
+
+Three runs of `glm_bench_dflash --load ... --rows 8` on the same checkpoint and the same
+deterministic taps:
+
+    hn: 32768/32768 finite, 6 exact zeros, range [-10.1250, 6.8750]
+    hn: 32768/32768 finite, 2 exact zeros, range [-9.7500, 13.0000]
+    hn: 32768/32768 finite, 3 exact zeros, range [-10.6250, 9.5000]
+
+Same inputs, three different blocks. Something reads memory that was never written, or a race in
+one of the six launches a layer. The candidates, in the order I would eliminate them:
+
+- `attn_part`'s chunk count: `Run::pass` passes `CH` (16) as the number of key chunks, which is
+  the only argument whose meaning I inferred rather than read out of the kernel. If the kernel
+  derives its slice from it, the partials it never writes are read back by `attn_merge` from
+  whatever the previous call left -- and on a fresh allocation, from nothing.
+- The empty context: with `starts = froms = 0` the ring holds no keys, and the window arithmetic
+  at the block boundary (`from` before row 0) is a case TensorFold may never exercise in serving.
+- `pm`/`pl`/`pacc` between launches.
+
+This has to be settled before any acceptance number: a drafter that scores a different block each
+run cannot be reasoned about, and the acceptance rate would look plausibly bad for a reason that
+is not the design.

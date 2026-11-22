@@ -1,0 +1,11 @@
+[package]
+name = "tidelm-dflash"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The DFlash2 drafter's driver: its weights, the block pass over dflash.cu, and the selector's walk. Sits below both the bench (tidelm-glm) and the serving loop (tidelm-engine)"
+
+[dependencies]
+tidelm-cuda = { path = "../tidelm-cuda" }
+tidelm-kernels = { path = "../tidelm-kernels" }
+tidelm-model = { path = "../tidelm-model" }

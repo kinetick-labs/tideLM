@@ -15,9 +15,9 @@
 use std::time::Instant;
 
 use tidelm_cuda::{DeviceBuffer, Stream};
-use tidelm_glm::dflash::{Drafter, BLOCK, LAYERS};
-use tidelm_glm::dflash_fwd::Run;
-use tidelm_glm::weights::Loader;
+use tidelm_dflash::{Drafter, BLOCK, LAYERS};
+use tidelm_dflash::Run;
+
 use tidelm_glm::Result;
 use tidelm_kernels::blas::Blas;
 use tidelm_kernels::dflash as k;
@@ -42,9 +42,8 @@ fn main() -> Result<()> {
     tidelm_cuda::set_device(0)?;
     let st = Stream::new()?;
     let ckpt = Checkpoint::open(std::path::Path::new(&dir))?;
-    let loader = Loader { ck: &ckpt, rank: 0, world: 1, st: &st };
     let t0 = Instant::now();
-    let dr = Drafter::load(&loader)?;
+    let dr = Drafter::load(&ckpt)?;
     println!("loaded in {:.1} s: {:.2} GB of weights (published 2.2 GB), {LAYERS} layers", t0.elapsed().as_secs_f32(),
              dr.nbytes() as f32 / 1e9);
 

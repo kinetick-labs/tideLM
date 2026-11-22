@@ -309,11 +309,13 @@ impl Run {
     }
 
     /// `x = rmsnorm(fc(cin), hidden_norm)`: the five taps into the drafter's width.
-    pub fn embed_taps(&self, blas: &Blas, dr: &Drafter) -> Result<()> {
+    pub fn embed_taps(&self, st: &Stream, blas: &Blas, dr: &Drafter) -> Result<()> {
         self.gemm(blas, &self.cin, &dr.fc, k::D, 5 * k::D, &self.y2)?;
+        self.mark(st, &self.cin, "embed cin")?;
+        self.mark(st, &self.y2, "embed fc")?;
         unsafe {
             glm::glm_rmsnorm(
-                std::ptr::null_mut(),
+                st.raw(),
                 np(&self.y2),
                 k::D as i64,
                 std::ptr::null(),
@@ -335,6 +337,18 @@ impl Run {
         self.pass_n(st, blas, dr, LAYERS)
     }
 
+    /// One discarded pass: the weights' first touch is 2.2 GB of DRAM, and a timing that includes
+    /// it measures the load, not the arithmetic. Not a correctness step -- the pass is bit-for-bit
+    /// reproducible without it, which is how the stream bug below was found.
+    pub fn warm(&self, st: &Stream, blas: &Blas, dr: &Drafter) -> Result<()> {
+        for _ in 0..1 {
+            self.embed_taps(st, blas, dr)?;
+            self.pass(st, blas, dr)?;
+        }
+        st.synchronize()?;
+        Ok(())
+    }
+
     /// `pass` over the first `n` layers only: the bisection `pass`'s determinism needs, and the
     /// only way to say which layer first reads something nobody wrote.
     pub fn pass_n(&self, st: &Stream, blas: &Blas, dr: &Drafter, n: usize) -> Result<()> {
@@ -347,19 +361,40 @@ impl Run {
                                  m as i32, d as i32, EPS);
                 self.gemm(blas, &self.y, &l.a_proj, DYN, d, &self.dynw)?;
                 k::glm_df_launch_conv(sr, np(&self.y), np(&self.dynw), 0, np(&l.a_base), np(&self.y2), m as i32, 0);
+                if li == 0 {
+                    self.mark(st, &self.y, "l0 norm")?;
+                    self.mark(st, &self.dynw, "l0 dyn")?;
+                    self.mark(st, &self.y2, "l0 conv0")?;
+                }
                 // qkv = qkv_lin(y2), then the queries and this block's keys/values
                 self.gemm(blas, &self.y2, &l.qkv, QKV, d, &self.qkv)?;
+                if li == 0 {
+                    self.mark(st, &self.qkv, "l0 qkv")?;
+                }
                 k::glm_df_launch_block_qkv(sr, np(&self.qkv), QKV as i32, np(&l.qn), np(&l.kn), np(&self.bpos), m as i32,
                                            EPS, THETA, np(&self.q), np(&self.kb), np(&self.vb));
+                if li == 0 {
+                    self.mark(st, &self.q, "l0 q")?;
+                    self.mark(st, &self.kb, "l0 kb")?;
+                }
                 // attention over the ring's window plus the block's own 8 keys, in 16 chunks
                 k::glm_df_launch_attn_part(sr, np(&self.q), np(&self.kb), np(&self.vb), np(&self.rings), np(&self.starts),
                                            np(&self.froms), self.streams as i32, li as i32, SCALE, k::CH as i32,
                                            np(&self.pm), np(&self.pl), np(&self.pacc));
                 k::glm_df_launch_attn_merge(sr, np(&self.pm), np(&self.pl), np(&self.pacc), m as i32, np(&self.att));
+                if li == 0 {
+                    self.mark(st, &self.att, "l0 att")?;
+                }
                 // a = o(att); x += conv(a, which 1)
                 self.gemm(blas, &self.att, &l.o, d, k::QH * k::HD, &self.a)?;
+                if li == 0 {
+                    self.mark(st, &self.a, "l0 o")?;
+                }
                 let base1 = self.base_at(&l.a_base, 1);
                 k::glm_df_launch_conv(sr, np(&self.a), np(&self.dynw), 1, base1, np(&self.x), m as i32, 1);
+                if li == 0 {
+                    self.mark(st, &self.x, "l0 attn out")?;
+                }
                 // the MLP, wrapped the same way
                 glm::glm_rmsnorm(sr, np(&self.x), d as i64, std::ptr::null(), 0, np(&l.post_norm), np(&self.y), d as i64,
                                  m as i32, d as i32, EPS);
@@ -376,6 +411,19 @@ impl Run {
                              m as i32, d as i32, EPS);
         }
         self.gemm(blas, &self.hn, &dr.hproj, RANK, d, &self.g)
+    }
+
+    /// With `DF_DUMP=1`, each intermediate's hash after the kernels of layer 0: two passes whose
+    /// hashes agree mean the drift is downstream of the last label that printed.
+    fn mark(&self, st: &Stream, b: &DeviceBuffer<u16>, label: &str) -> Result<()> {
+        if std::env::var("DF_DUMP").as_deref() != Ok("1") {
+            return Ok(());
+        }
+        st.synchronize()?;
+        let v = b.download()?;
+        let h = v.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3));
+        eprintln!("  {label}: {h:016x} first {:?}", &v[..4]);
+        Ok(())
     }
 
     /// y[M][N] = x[M][K] . W^T, with W the [N][K] bf16 the checkpoint stores.

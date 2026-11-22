@@ -79,16 +79,14 @@ fn main() -> Result<()> {
     run.set_tables(&st, &starts, &froms, &bpos)?;
 
     let blas = Blas::new(st.raw())?;
-    // Warm: first touch of 2.2 GB of weights is the weight, not the arithmetic.
-    run.embed_taps(&blas, &dr)?;
-    run.pass(&st, &blas, &dr)?;
-    st.synchronize()?;
+    // Warm: the weights' first touch is 2.2 GB of DRAM.
+    run.warm(&st, &blas, &dr)?;
 
     let mut embed = Vec::new();
     let mut layers = Vec::new();
     for _ in 0..iters {
         let t = Instant::now();
-        run.embed_taps(&blas, &dr)?;
+        run.embed_taps(&st, &blas, &dr)?;
         st.synchronize()?;
         embed.push(t.elapsed().as_secs_f64() * 1e3);
         let t = Instant::now();
@@ -107,7 +105,7 @@ fn main() -> Result<()> {
     // Same process, same buffers, three passes: agreement here and disagreement across runs would
     // mean the allocation is the variable (uninitialised memory); disagreement here is a race.
     for i in 0..3 {
-        run.embed_taps(&blas, &dr)?;
+        run.embed_taps(&st, &blas, &dr)?;
         run.pass_n(&st, &blas, &dr, nlayers)?;
         st.synchronize()?;
         let v = run.hn.download()?;

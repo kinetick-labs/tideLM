@@ -228,3 +228,23 @@ acceptance measurement meaningless until it is fixed.
 
 Neither is a numerical-noise story: a bf16 rounding difference cannot turn a sum of 32768 hiddens
 from +30 to -85, and cannot move `hn[0]` from 0.016 to 0.81.
+
+## Settled: one null stream, not two faults
+
+The block pass was nondeterministic because `embed_taps` passed `null_mut()` as the stream to
+`glm_rmsnorm` (`dflash_fwd.rs`, the hidden norm). That launch went to the **default stream** while
+the `fc` GEMM before it ran on the ring's stream: nothing ordered the two, so the norm read the
+gemm's output while it was still being written.
+
+It looked like two faults and was one. The bisection read as "cold start plus per-call drift"
+because a race is a function of timing: at `--iters 1` the third pass already matched, at
+`--iters 3` none of them did, and the value all runs converged on (sum -84.817) was the race
+losing every time.
+
+With `st.raw()` there, three passes and two separate processes give the same block, bit for bit:
+
+    min -14.8750 max 10.5625 sum -90.274 first [-0.3203, 0.5586, 0.4707, 2.4844]
+
+`DF_DUMP=1` is what made it visible: the first label (`l0 norm`) already disagreed, which put the
+fault upstream of every layer kernel rather than inside one. The instrumentation stays -- the next
+noon one is inside `embed_taps` or the head, and it costs nothing when the variable is unset.

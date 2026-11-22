@@ -133,7 +133,7 @@ impl Options {
              lanes {}\nkv_tokens {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
-            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE", "TIDELM_INK_PF_FLASH", "TIDELM_INK_FLASH_DECODE", "TIDELM_INK_FUSE", "GLM_INK_KV"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE", "TIDELM_INK_PF_FLASH", "TIDELM_INK_FLASH_DECODE", "TIDELM_INK_FUSE", "GLM_INK_KV", "GLM_DRAFTER", "GLM_DRAFTER_DIR"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
@@ -323,11 +323,10 @@ pub struct Dflash {
     pub blas: Blas,
     /// Rounds in a row that produced no accepted draft. At 8 the drafter stands down: one that
     /// accepts nothing still pays the verify pass' eight rows and returns one token, which measured
-    /// 3,7x slower than not drafting at all (5,17 against 19,38 tok/s). Standing down recovers that
-    /// without a restart; only a new process brings it back, which is honest -- there is no evidence
-    /// that waiting helps a drafter whose input is empty.
+    /// 3.7x slower than not drafting at all (5.17 against 19.38 tok/s). Warmup clears it
+    /// (`reset_dflash`); a serving process that has stood down stays down.
     miss: std::sync::atomic::AtomicU32,
-    /// Passes logged by the row-count probe, so one served request names the truth once.
+    /// The first draft of the process logs its ids once.
     logged: std::sync::atomic::AtomicU32,
 }
 
@@ -336,10 +335,10 @@ impl Dflash {
     /// round's last projection failed with cublas status 13 there -- which turned out to be an
     /// out-of-bounds read in ctx_kv landing on the next checked call, not the handle. The private
     /// pair stays because removing it faulted glm_df_select; see a2274c5 and b61cab6.
-    pub fn open(dir: &Path, rows: usize) -> Result<Self> {
+    pub fn open(dir: &Path, rows: usize, lanes: usize) -> Result<Self> {
         let ck = tidelm_model::Checkpoint::open(dir)?;
         let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
-        let blk = tidelm_dflash::Block::new(&dr, rows).map_err(|e| format!("dflash: {e}"))?;
+        let blk = tidelm_dflash::Block::open(&dr, rows, lanes).map_err(|e| format!("dflash: {e}"))?;
         let own = Stream::new()?;
         let blas = Blas::new(own.raw()).map_err(|e| format!("dflash: {e}"))?;
         Ok(Dflash { dr, blk, own, blas,
@@ -830,13 +829,20 @@ impl Engine {
         // are on the device. Printed, not silent: with --depth also on, DSpark drafts too, and the
         // two are indistinguishable from outside by their accept rates alone.
         if std::env::var("GLM_DRAFTER").as_deref() == Ok("dflash2") {
+            if world != 1 {
+                return Err("GLM_DRAFTER=dflash2 reads the whole vocabulary, so it is the one-box path".into());
+            }
+            if engine.cfg.hc.is_none() || engine.cfg.hidden != tidelm_kernels::dflash::D {
+                return Err("GLM_DRAFTER=dflash2 reads GLM-5.3-Flash's 4-stream residual".into());
+            }
             let dir = std::env::var_os("GLM_DRAFTER_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| model_dir.join("../glm53-dflash2"));
-            let df = Dflash::open(&dir, VERIFY_ROWS)?;
-            println!("boot: DFlash2 drafter {} ({:.2} GiB, {} layers, block {}, {} rows)",
+            let df = Dflash::open(&dir, VERIFY_ROWS, lanes)?;
+            let lane_mb = (df.dr.ring_row * 2 + tidelm_dflash::WIN * 5 * tidelm_kernels::dflash::D * 2) as f64 / (1u64 << 20) as f64;
+            println!("boot: DFlash2 drafter {} ({:.2} GiB weights, {} layers, block {}, {} lanes x {:.0} MB ring+window)",
                      dir.display(), df.dr.nbytes() as f64 / (1u64 << 30) as f64,
-                     tidelm_dflash::LAYERS, tidelm_dflash::BLOCK, VERIFY_ROWS);
+                     tidelm_dflash::LAYERS, tidelm_dflash::BLOCK, lanes, lane_mb);
             engine.dflash = Some(df);
         }
         Ok(engine)
@@ -846,38 +852,91 @@ impl Engine {
         &self.st
     }
 
-    /// DFlash2's seven drafts for a lane: the block's tables, the ring seeded from the taps the
-    /// last verify step captured, one round against the target's own head. Empty when no drafter
-    /// is attached, so the caller's loop needs no second condition.
-    pub fn dflash_drafts(&self, starts: &[i64], froms: &[i64], bpos: &[i64], bseed: &[i64], anchors: &[i32]) -> Result<Vec<i32>> {
-        let df = match self.dflash.as_ref() {
-            Some(d) => d,
-            None => return Ok(Vec::new()),
-        };
-        if df.miss.load(std::sync::atomic::Ordering::Relaxed) >= 8 {
+    /// DFlash2's seven drafts for one lane. The block is embeddings of the anchor and seven mask
+    /// tokens at `anchor_pos`, the context is `kv(rmsnorm(fc(taps)))` of the positions before it,
+    /// and the candidates are a fresh pass of the target's `lm_head` over the drafter's hidden.
+    /// Empty when no drafter is attached, so the caller's loop needs no second condition.
+    pub fn dflash_drafts(&self, lane: usize, anchor_pos: i64, anchor: i32) -> Result<Vec<i32>> {
+        if self.dflash.is_none() {
             return Ok(Vec::new());
         }
-        // The engine's loop is serial here: join it, run the round on the drafter's own stream, and
-        // join back. Two syncs a round buy isolation from the engine's cublas handle state, which is
-        // what the status 13 was.
-        self.st.synchronize()?;
-        // The window first: the captured residuals of the sequence so far, a BLOCK rows a pass, so the
-        // ring holds the prompt's own state. Falls back to the block's eight rows while the capture
-        // is still shorter than a block.
-        let seeded = df.blk.seed_window(&df.own, &df.blas, &df.dr, starts[0])
-            .map_err(|e| format!("dflash window seed: {e}"))?;
-        if seeded == 0 {
-            df.blk.run.set_tables(&df.own, starts, froms, bpos, bseed).map_err(|e| format!("dflash tables: {e}"))?;
-            df.blk.seed_taps(&df.own, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
+        if self.dflash.as_ref().unwrap().miss.load(std::sync::atomic::Ordering::Relaxed) >= 8 {
+            return Ok(Vec::new());
         }
-        // The seed moved the tables; the block's round needs its own back.
-        df.blk.run.set_tables(&df.own, starts, froms, bpos, bseed).map_err(|e| format!("dflash tables: {e}"))?;
-        // The target's head is `vl` wide (147,456 at world 1), not the drafter checkpoint's
-        // VOCAB: scoring the block over the wrong stride read 68 KB past the logits buffer.
-        let picks = df.blk.round_bf16(&df.own, &df.blas, &df.dr, np(&self.act.head), anchors, self.vl)
-            .map_err(|e| format!("dflash round: {e}"))?;
-        df.own.synchronize()?;
+        // The engine's loop is serial here: join it, run the block on the drafter's own stream,
+        // join back, then the head on the engine's stream. The private stream stays because
+        // dropping it faulted glm_df_select.
+        self.st.synchronize()?;
+        let (table, embed_rows) = match &self.w.embed {
+            crate::weights::Embed::Bf16(t) => (t.raw() as *const c_void, t.len() / self.cfg.hidden),
+            crate::weights::Embed::Int8 { .. } => {
+                return Err("dflash needs GLM-5.3-Flash's bf16 embedding table".into());
+            }
+        };
+        if tidelm_dflash::MASK as usize >= embed_rows {
+            return Err(format!("dflash mask {} is past the embedding table ({embed_rows} rows)", tidelm_dflash::MASK).into());
+        }
+        let (span, hn) = {
+            let df = self.dflash.as_ref().unwrap();
+            let lane_state = df.blk.lanes.get(lane)
+                .ok_or_else(|| format!("dflash lane {lane} of {}", df.blk.lanes.len()))?;
+            let seeded = lane_state.seeded_to.load(std::sync::atomic::Ordering::Relaxed);
+            let trust = lane_state.trust_lo.load(std::sync::atomic::Ordering::Relaxed);
+            let span = tidelm_dflash::ingest_span(seeded, anchor_pos, trust);
+            df.blk.prepare(&df.own, &df.blas, &df.dr, lane, anchor_pos, anchor, table, self.cfg.hidden as i32)
+                .map_err(|e| format!("dflash block: {e}"))?;
+            df.own.synchronize()?;
+            (span, df.blk.run.hn.raw())
+        };
+        // The head the drafter was trained against is the target's, over the block's own hidden.
+        // The previous verify's logits are a different distribution, and scoring those is what
+        // left every draft an anchor (accept 1.04).
+        self.lin(&self.w.head, hn, self.cfg.hidden, tidelm_dflash::BLOCK, np(&self.act.head), false)?;
+        self.st.synchronize()?;
+        let vl = self.vl;
+        let off = self.rank * self.vl;
+        let head = np(&self.act.head);
+        let df = self.dflash.as_ref().unwrap();
+        let picks = df.blk.score(&df.own, &df.dr, head, vl, off, anchor).map_err(|e| format!("dflash score: {e}"))?;
+        let n = df.logged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            let (lo, hi) = span.unwrap_or((-1, -1));
+            eprintln!("dflash: lane {lane} anchor {anchor} at {anchor_pos}, context [{lo}, {hi}), drafts {picks:?}");
+        }
         Ok(picks)
+    }
+
+    /// A new sequence on `lane`, prefilled from `keep`. The ring is refolded from there: window
+    /// slots below `keep` can still hold a generation this request rewound past.
+    pub fn dflash_forget(&self, lane: usize, keep: i64) {
+        if let Some(df) = self.dflash.as_ref() {
+            df.blk.forget(lane, keep);
+        }
+    }
+
+    /// Warmup's synthetic prompts are not evidence the drafter accepts nothing. If they stood it
+    /// down, say so: the line above claimed the process was done drafting.
+    pub fn reset_dflash(&self) {
+        if let Some(df) = self.dflash.as_ref() {
+            let m = df.miss.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if m >= 8 {
+                eprintln!("dflash: warmup cleared the stand-down ({m} misses)");
+            }
+        }
+    }
+
+    /// Layer `closed` just had its MLP mixed into the residual. That is the hidden state the
+    /// drafter was trained on (`hidden_states[layer + 1]` in the reference), and it is written
+    /// at the start of the next layer, not at the end of this one.
+    fn dflash_capture(&self, closed: usize, t: usize) -> Result<()> {
+        let Some(df) = self.dflash.as_ref() else { return Ok(()) };
+        let Some(slot) = tidelm_dflash::tap_slot(closed) else { return Ok(()) };
+        if t == 0 {
+            return Ok(());
+        }
+        df.blk.tap_lanes(&self.st, np(&self.act.h), np(&self.act.pos), np(&self.act.rlane), slot, t)
+            .map_err(|e| format!("dflash tap layer {closed}: {e}"))?;
+        Ok(())
     }
 
     /// One round's outcome, so the drafter can stand down when it is costing without returning.
@@ -1828,39 +1887,6 @@ impl Engine {
         for l in 0..self.cfg.layers {
             self.layer_pre(l, t, prefill)?;
             self.mlp(l, t, prefill)?;
-            // DFlash2's taps: these layers' residuals, on the 8-row verify step only. `layer_pre`
-            // delegates to flash_layer_pre when cfg.hc is set (the GLM-5.3-Flash path), which is
-            // why the tap sits here, after mlp, rather than inside either of them.
-            // Row-count probe: `t == VERIFY_ROWS` is the tap's whole condition, and a tap that never
-            // fires leaves the block reading whatever `cin` held at allocation. Log the first passes'
-            // row counts once, at layer 0, so one served request names the truth.
-            if l == 0 {
-                if let Some(df) = self.dflash.as_ref() {
-                    let n = df.logged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 12 {
-                        eprintln!("dflash pass: t={t} target={VERIFY_ROWS}");
-                    }
-                }
-            }
-            // The window capture: a prefill chunk is the only pass with WIN rows of residuals, and
-            // those rows are what the seed needs to speak for the prompt instead of for eight keys.
-            if t > 2 * VERIFY_ROWS {
-                if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
-                    df.blk.run.tap_window(&self.st, np(&self.act.h), np(&self.act.pos), slot, t, 0)
-                        .map_err(|e| format!("dflash window tap: {e}"))?;
-                }
-            }
-            // A verify pass carries one block per lane, packed back to back (`row0 += 1 + nd` in
-            // serve.rs), so its width is the sum over lanes -- 15 for two blocks of eight and seven,
-            // which is why `t == VERIFY_ROWS` was true twice a request and never on the round that
-            // mattered. The drafter reads the first block's rows, and this hook taps rows 0..8 of the
-            // pass: correct while the drafting lane is the first block, which is what `one lane at a
-            // time` buys. A prefill chunk is wider than two blocks and stays out by the upper bound.
-            if t >= VERIFY_ROWS && t <= 2 * VERIFY_ROWS {
-                if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
-                    df.blk.run.tap(&self.st, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;
-                }
-            }
         }
         self.prefetch_join()?;
         self.final_norm(t)

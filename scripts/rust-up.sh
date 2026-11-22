@@ -111,6 +111,14 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
         || err "the Rust GLM engine sums prefill partials in bf16 or fp32 only (profile: GLM_PREFILL_REDUCE=$GLM_PREFILL_REDUCE)"
     pack=${GLM_EXL3_PACK:-}
     [[ -n "$pack" ]] || err "$f sets no GLM_EXL3_PACK"
+    # DFlash2 is off unless both are set. The directory check runs in --check too, so a profile
+    # that names a missing drafter fails before the weights load.
+    if [[ "${GLM_DRAFTER:-}" == dflash2 ]]; then
+        [[ -n "${GLM_DRAFTER_DIR:-}" && -f "$GLM_DRAFTER_DIR/config.json" ]] \
+            || err "GLM_DRAFTER=dflash2 needs GLM_DRAFTER_DIR, a drafter checkpoint with config.json"
+    elif [[ -n "${GLM_DRAFTER:-}" ]]; then
+        err "GLM_DRAFTER=$GLM_DRAFTER is not a drafter this engine serves (dflash2, or leave it unset)"
+    fi
     [[ $check == 1 ]] && exit 0
     pack=${pack/#\/packs/${GLM_EXL3_DIR:-/packs}}
     db=${GLM_STATS_DB:-}
@@ -208,6 +216,12 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
         envs+=(GLM_DRAFT_VOCAB="$GLM_DRAFT_VOCAB")
     fi
     [[ -n "${GLM_DRAFT_VOCAB_ROWS:-}" ]] && envs+=(GLM_DRAFT_VOCAB_ROWS="$GLM_DRAFT_VOCAB_ROWS")
+    # DFlash2's checkpoint is a separate directory. The engine reads both names; without the mount
+    # the container cannot open the drafter and the boot line never appears.
+    if [[ "${GLM_DRAFTER:-}" == dflash2 ]]; then
+        envs+=(GLM_DRAFTER=dflash2 GLM_DRAFTER_DIR="$GLM_DRAFTER_DIR")
+        ro+=("$GLM_DRAFTER_DIR")
+    fi
     # GLM-5.3-Flash's image input: the tower is loaded on demand into lent expert slots
     [[ "${GLM_VISION:-0}" == 1 ]] && envs+=(GLM_VISION=1 GLM_VISION_MAX_TOKENS="${GLM_VISION_MAX_TOKENS:-8000}")
     # GLM_ABLIT: the abliteration's directions (rust/crates/tidelm-glm/src/ablit.rs), a host path
@@ -342,7 +356,7 @@ fi
 # TIDELM_GLM_STAGE_LOG=1: GLM, a line a forward counting the stagings that found the last one's copies still queued
 # TIDELM_GLM_HOT_TRACE: GLM, rank 0 appends every decode pass's routing table and async hot reads to
 # this path (in a mounted directory), for tools/glm_hot_sim.py
-for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG TIDELM_PDL \
+for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG TIDELM_PDL DF_CAND DF_DUMP \
          TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT TIDELM_GLM_HOT_TRACE TIDELM_GLM_VERIFY_PLAN TIDELM_GLM_ACT_PLAN TIDELM_GLM_PREFILL_CHECK TIDELM_GLM_HOT_ORACLE TIDELM_FLASH_HC_FUSED TIDELM_FLASH_PF TIDELM_FLASH_PF_O TIDELM_FLASH_PF_SH TIDELM_GLM_STAGE_LOG; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "

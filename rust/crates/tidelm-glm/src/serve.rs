@@ -778,6 +778,10 @@ impl Server {
         // the lane's sequence where that answer began; a regenerate); anything else prefills again
         let keep = if self.eng.can_rewind(keep) { keep } else { self.eng.restore_point(lane, keep) };
         self.eng.set_pos(keep)?;
+        // The lane's ring still holds the previous sequence, and a generation that ran past
+        // `keep` has overwritten the circular slots the kept prefix would need. The prefill
+        // retaps from `keep`; the first draft folds only that, and attention starts there.
+        self.eng.dflash_forget(lane, keep as i64);
         let mut g = g;
         g.cached = keep;
         let suffix = prompt[keep..].to_vec();
@@ -1204,38 +1208,32 @@ impl Server {
         // cache row alone), the next ones the lanes whose chain goes on
         // Inkling 2: one block pass of the DSpark drafter a lane gives its 7 drafts at once (greedy:
         // q is a point mass, as a copy's), kept while the gate holds; no MTP layer, no chain of passes
-        // DFlash2: one block round gives every non-plain, non-copy lane its drafts, scored by the
-        // target's own head over the same rows the last verify step ran. Beside DSpark's branch
-        // rather than inside it: DSpark drafts for Inkling 2, this for GLM-5.3-Flash, and the
+        // DFlash2: one block a lane. The input is the anchor's embedding and seven mask embeddings,
+        // the context is the tapped residuals folded into that lane's ring, and the candidates are
+        // a fresh lm_head of the drafter's hidden — not the previous verify's logits. Beside
+        // DSpark's branch: DSpark drafts for Inkling 2, this for GLM-5.3-Flash, and the
         // verification that follows is the same code.
         if self.eng.dflash.is_some() {
             for k in 0..blocks.len() {
                 if blocks[k].plain || blocks[k].copy {
                     continue;
                 }
-                let p0 = blocks[k].p as i64 + 1;
-                // The taps hold the residuals of the rows the last pass ran, i.e. positions
-                // p0-1 .. p0+BLOCK-2 -- so the block's row i is at p0-1+i, not p0+i. Declaring the
-                // latter rotated every row a token ahead of its own content: a systematic
-                // off-by-one in both the RoPE and the walker's per-step row, which reads exactly
-                // like a drafter that never guesses right.
-                let bpos: Vec<i64> = (0..tidelm_dflash::BLOCK as i64).map(|i| p0 - 1 + i).collect();
-                // The short seed covers the BLOCK positions before the anchor, which is the window
-                // attention reads. `from` is the first of them: any earlier position in the ring
-                // was never written by this sequence.
-                let bseed: Vec<i64> = (0..tidelm_dflash::BLOCK as i64).map(|i| p0 - tidelm_dflash::BLOCK as i64 + i).collect();
-                let from = bseed[0].max(0);
+                // `p` is the position the anchor is about to be consumed at (lane_pos). The block's
+                // row t sits at p+t: row 0 the anchor, rows 1..7 the mask tokens whose head is
+                // compared with the verify's rows 0..6. Shifting the start by one put attention's
+                // window a token ahead of the RoPE positions.
+                let anchor_pos = blocks[k].p as i64;
+                let lane = runs[blocks[k].i].lane;
                 let anchor = runs[blocks[k].i].anchor as i32;
-                let picks = self.eng.dflash_drafts(&[p0], &[from], &bpos, &bseed, &[anchor])?;
+                let picks = self.eng.dflash_drafts(lane, anchor_pos, anchor)?;
                 let dmax = blocks[k].dmax;
                 blocks[k].drafts = picks.into_iter().take(dmax).map(|d| d as u32).collect();
                 blocks[k].qs = vec![None; blocks[k].drafts.len()];
             }
         }
-        // Not both: DFlash2's seven picks and the MTP chain's seven compose a fifteen-row verify
-        // pass, which is what the row-count probe found (t=15 eight times, t=8 only twice). The tap's
-        // condition is t == VERIFY_ROWS, so the block's input came from those two stray passes and
-        // every other round drafted from stale residuals. One drafter a lane, chosen by attachment.
+        // Not both. DFlash2's seven and the MTP chain's seven on one lane were fourteen drafts, and
+        // acceptance stops at the first mismatch, so the block was never what got compared
+        // (t=15 eight times, t=8 twice). One drafter a lane, chosen by attachment.
         let dspark = self.eng.has_drafter() && self.eng.dflash.is_none();
         if dspark {
             for k in 0..blocks.len() {
@@ -1275,11 +1273,10 @@ impl Server {
                 }
             }
         }
-        // A lane gets one drafter. This line is where DFlash2 lost its acceptance: with the MTP
-        // chain still running on the same lane, `drafts` held fourteen entries -- MTP's seven first
-        // -- and the acceptance loop stops at the first mismatch, so DFlash2's chain was never read.
-        // The round log is what showed it: drafts [8, 0, 13, 4, 8, 0, 0, 1001, 1002, ...] against a
-        // target starting at 1001, matching five in a row from entry seven on.
+        // A lane gets one drafter. Running the MTP chain on the same lane put MTP's seven drafts
+        // ahead of DFlash2's, and acceptance stops at the first mismatch (measured: the tail of
+        // that vector matched the target and the head never did). The small ids in that head
+        // were token ids from the wrong distribution, not slot ranks.
         let mtp_lanes: Vec<usize> = if dspark || self.eng.dflash.is_some() {
             vec![]
         } else {
@@ -1472,7 +1469,6 @@ impl Server {
                 st.rounds += 1;
                 st.drafted += nd;
                 st.accepted += n_acc;
-                self.eng.note_dflash(n_acc);
                 if b.long {
                     st.long_copies += 1;
                 }
@@ -1480,6 +1476,12 @@ impl Server {
                     st.copy_rounds += 1;
                     st.copy_accepted += n_acc;
                 }
+            }
+            // Once a round, and only for a block this drafter produced. Inside the stats loop it
+            // counted twice, so the stand-down of 8 rounds happened at 4. A copy block did not
+            // draft, and its misses are not the drafter's.
+            if self.eng.dflash.is_some() && !b.copy {
+                self.eng.note_dflash(n_acc);
             }
             r.g.accepted.push(n_acc);
             r.g.depths.push(nd);
@@ -1600,6 +1602,7 @@ impl Server {
         self.stats = Stats::default();
         self.eng.res.stats = Default::default();
         self.eng.zero_demand()?;
+        self.eng.reset_dflash();
         for l in 0..self.eng.lanes() {
             self.eng.kv_shrink(l, 0)?;
         }

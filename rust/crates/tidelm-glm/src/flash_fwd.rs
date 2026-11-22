@@ -465,6 +465,10 @@ impl Engine {
         if self.hc_fused_for(t) {
             self.hc_site(l, 0, t, l > 0)?;
             if l > 0 {
+                // The previous layer's MLP was just mixed into the residual. Tapping after mlp()
+                // reads the stream before that mix, one site early, which is not a layer the
+                // drafter was trained on.
+                self.dflash_capture(l - 1, t)?;
                 self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(l - 1))?;
             } else {
                 self.dump("tok", np(&self.act.tok), t * 4, None)?;
@@ -475,6 +479,7 @@ impl Engine {
         }
         if l > 0 {
             self.hc_post(1, t)?;
+            self.dflash_capture(l - 1, t)?;
             self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(l - 1))?;
         } else {
             self.dump("tok", np(&self.act.tok), t * 4, None)?;

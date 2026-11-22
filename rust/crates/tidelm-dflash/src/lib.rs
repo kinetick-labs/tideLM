@@ -388,6 +388,13 @@ impl Run {
         Ok(())
     }
 
+    /// Point every stream's ring at `ring`. `set_tables` points them at `self.ring`; the serving
+    /// path calls this after it, so the block reads the lane's ring.
+    pub fn bind_ring(&self, st: &Stream, ring: *mut c_void) -> Result<()> {
+        let r = vec![ring as u64; self.streams];
+        self.rings.upload_async(0, &r, st).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+    }
+
     /// Capture at the layer whose residual is `x` (`[rows][4][D]`, the four streams) into tap
     /// slot `slot`: the mean of the streams, which is the layout `fc` reads.
     pub fn tap(&self, st: &Stream, x: *const c_void, slot: usize) -> Result<()> {
@@ -402,6 +409,11 @@ impl Run {
         }, "tap ring")?;
         self.win_rows.fetch_max(base + rows, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// `n` context rows from a lane's window, starting at position `start`, packed into `cin`.
+    pub fn load_win(&self, st: &Stream, win: *const c_void, start: i64, n: usize) -> Result<()> {
+        ck(unsafe { k::glm_df_launch_win_load(st.raw(), win, start as i32, np(&self.cin), n as i32) }, "win load")
     }
 
     /// `x = rmsnorm(fc(cin), hidden_norm)`: the five taps into the drafter's width.
@@ -525,20 +537,38 @@ impl Run {
     /// y[M][N] = x[M][K] . W^T, with W the [N][K] bf16 the checkpoint stores.
     fn gemm(&self, blas: &Blas, x: &DeviceBuffer<u16>, w: &DeviceBuffer<u16>, n: usize, kk: usize,
             y: &DeviceBuffer<u16>) -> Result<()> {
-        blas.gemm_rm(self.rows, n, kk, Mat { ptr: x.raw(), ty: R_16BF, ld: kk as i64 },
+        self.gemm_m(blas, self.rows, x, w, n, kk, y)
+    }
+
+    /// `gemm` over `m` rows. The block is always `self.rows`; a context chunk is shorter.
+    fn gemm_m(&self, blas: &Blas, m: usize, x: &DeviceBuffer<u16>, w: &DeviceBuffer<u16>, n: usize, kk: usize,
+              y: &DeviceBuffer<u16>) -> Result<()> {
+        blas.gemm_rm(m, n, kk, Mat { ptr: x.raw(), ty: R_16BF, ld: kk as i64 },
                      Mat { ptr: w.raw(), ty: R_16BF, ld: kk as i64 }, true, y.raw(), R_16BF, n as i64)
             .map_err(|e| {
                 // The shapes a failure happened on, once: a status 13 in the serving loop and not in
                 // the bench is a fact about this call, not about cublas.
-                e.into()
+                format!("m={m} n={n} k={kk}: {e}").into()
             })
-
     }
 
     /// `base_kernel` is [which][tap][D]; the kernel's `which = 1` wants the second `2 * D` block.
     fn base_at(&self, base: &DeviceBuffer<u16>, which: usize) -> *mut c_void {
         unsafe { (base.raw() as *mut u8).add(which * 2 * k::D * 2) as *mut c_void }
     }
+}
+
+/// One lane's context: a K/V ring and the last window of closed residuals. Serving keeps one of
+/// each per lane. The block's own `Run` ring is the bench's; two lanes on it overwrite each other.
+pub struct LaneMem {
+    pub ring: DeviceBuffer<u16>,
+    pub win: DeviceBuffer<u16>,
+    /// First position not yet folded into `ring`.
+    pub seeded_to: std::sync::atomic::AtomicI64,
+    /// Positions below this were not tapped for the sequence now on the lane. A rewind keeps the
+    /// target's cache and drops the drafter's: the circular window's slots for the kept prefix
+    /// may hold a later abandoned generation (position p and p + WIN share a slot).
+    pub trust_lo: std::sync::atomic::AtomicI64,
 }
 
 /// A block's tail: the candidates the target's head scores, and the selector's walk over them.
@@ -558,15 +588,27 @@ pub struct Block {
     /// `[BLOCK - 1][streams]`: which row each step reads its candidates from.
     pub rsel: DeviceBuffer<i32>,
     pub chunks: usize,
-    /// Last position the window was seeded at. The seed costs a drafter pass over the window; it
-    /// grows by a token or three a round, so re-seeding every 64 positions is enough to keep it
-    /// current at a fraction of a millisecond a step.
+    /// Last position `seed_window` folded. The serving path does not use it: each lane has its own
+    /// `LaneMem::seeded_to`, because one counter across GLM_LANES=2 would skip a lane's context.
     pub seeded_to: std::sync::atomic::AtomicI64,
     pub streams: usize,
+    /// One ring and one window a lane. `win_ptrs[lane]` is `lanes[lane].win`, uploaded once.
+    pub lanes: Vec<LaneMem>,
+    pub win_ptrs: DeviceBuffer<u64>,
+    /// The block's token ids: the anchor, then `MASK` seven times.
+    pub ids: DeviceBuffer<i32>,
 }
 
 impl Block {
+    /// One lane. The bench and the unmaintained engine-crate copy call this.
     pub fn new(dr: &Drafter, rows: usize) -> Result<Self> {
+        Self::open(dr, rows, 1)
+    }
+
+    /// `lanes` rings and windows beside the block workspace. A lane is 40 MB of K/V and 80 MB of
+    /// residuals; two lanes are the profile's GLM_LANES.
+    pub fn open(dr: &Drafter, rows: usize, lanes: usize) -> Result<Self> {
+        let lanes = lanes.max(1);
         let streams = rows / BLOCK;
         let chunks = VOCAB.div_ceil(4096);
         let mut rsel = Vec::with_capacity((BLOCK - 1) * streams);
@@ -574,6 +616,18 @@ impl Block {
             for s in 0..streams {
                 rsel.push((s * BLOCK + step) as i32);
             }
+        }
+        let mut lane_mem = Vec::with_capacity(lanes);
+        let mut ptrs = Vec::with_capacity(lanes);
+        for _ in 0..lanes {
+            let win = DeviceBuffer::zeroed(WIN * 5 * k::D)?;
+            ptrs.push(win.raw() as u64);
+            lane_mem.push(LaneMem {
+                ring: DeviceBuffer::zeroed(dr.ring_row)?,
+                win,
+                seeded_to: std::sync::atomic::AtomicI64::new(-1),
+                trust_lo: std::sync::atomic::AtomicI64::new(0),
+            });
         }
         Ok(Self {
             run: Run::new(dr, rows)?,
@@ -585,6 +639,9 @@ impl Block {
             chunks,
             seeded_to: std::sync::atomic::AtomicI64::new(-1),
             streams,
+            lanes: lane_mem,
+            win_ptrs: DeviceBuffer::from_slice(&ptrs)?,
+            ids: DeviceBuffer::zeroed(rows)?,
         })
     }
 
@@ -612,8 +669,12 @@ impl Block {
     }
 
     /// Seed the drafter's ring from the captured window: every BLOCK rows of the sequence's tail gets
-    /// its own pass over the block's ring, in position order, so the keys the next attention looks up
-    /// are the prompt's own state and not the eight rows of the verify step.
+    /// its own pass over the block's ring, in position order.
+    ///
+    /// Serving does not call this. The pass it runs is the block transformer, and the `ctx_kv` after
+    /// it reads `qkv`, which is that pass's Q|K|V, so the first 2048 columns written into the ring
+    /// are Q. Measured with it: accept 1.04 (docs/dflash2-campaign.md). `ingest_until` is the fold
+    /// the checkpoint was trained with: `kv(rmsnorm(fc(taps)))` at the context positions, no block.
     ///
     /// Groups of BLOCK, not one wide pass: the block kernels give a ring a stream and a stream BLOCK
     /// rows, so a 512-row pass would allocate 64 rings (2,5 GiB). This way nothing is allocated at
@@ -756,6 +817,130 @@ impl Block {
         self.chain.upload_async(0, ids, st)
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
     }
+
+    /// A new sequence on `lane`, whose prefill starts at `keep`. The ring is refolded, and nothing
+    /// below `keep` is read: those window slots may belong to a generation this request rewound
+    /// past.
+    pub fn forget(&self, lane: usize, keep: i64) {
+        if let Some(l) = self.lanes.get(lane) {
+            l.seeded_to.store(-1, std::sync::atomic::Ordering::Relaxed);
+            l.trust_lo.store(keep.max(0), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The closed residual of every row into that row's lane window, tap column `slot`.
+    pub fn tap_lanes(&self, st: &Stream, x: *const c_void, pos: *const c_void, lane: *const c_void, slot: usize,
+                     rows: usize) -> Result<()> {
+        ck(unsafe {
+            k::glm_df_launch_tap_lanes(st.raw(), x, pos, lane, self.win_ptrs.raw(), slot as i32, rows as i32,
+                                       self.lanes.len() as i32)
+        }, "tap lanes")
+    }
+
+    /// Fold context positions `[lo, hi)` into `lane`'s ring: `rmsnorm(fc(taps))` through each
+    /// layer's k and v, at those positions. Not a block pass. The reference's context is this
+    /// projection; running the block on the taps writes Q into the slots attention reads as K.
+    pub fn ingest_until(&self, st: &Stream, blas: &Blas, dr: &Drafter, lane: usize, anchor_pos: i64) -> Result<()> {
+        if lane >= self.lanes.len() {
+            return Err(format!("dflash lane {lane} of {}", self.lanes.len()).into());
+        }
+        let seeded = self.lanes[lane].seeded_to.load(std::sync::atomic::Ordering::Relaxed);
+        let trust = self.lanes[lane].trust_lo.load(std::sync::atomic::Ordering::Relaxed);
+        let Some((lo, hi)) = ingest_span(seeded, anchor_pos, trust) else { return Ok(()) };
+        let mut p = lo;
+        while p < hi {
+            let n = ((hi - p) as usize).min(BLOCK);
+            let win = self.lanes[lane].win.raw();
+            let ring = self.lanes[lane].ring.raw();
+            self.run.load_win(st, win, p, n)?;
+            self.project_ctx(st, blas, dr, n, p, ring)?;
+            p += n as i64;
+        }
+        self.lanes[lane].seeded_to.store(hi, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// `n` rows of `cin` through fc, the hidden norm and each layer's k|v, written at `pos0`.
+    fn project_ctx(&self, st: &Stream, blas: &Blas, dr: &Drafter, n: usize, pos0: i64, ring: *mut c_void) -> Result<()> {
+        if n == 0 || n > BLOCK {
+            return Err(format!("dflash context chunk {n}").into());
+        }
+        self.run.gemm_m(blas, n, &self.run.cin, &dr.fc, k::D, 5 * k::D, &self.run.y2)?;
+        ck(unsafe {
+            glm::glm_rmsnorm(st.raw(), np(&self.run.y2), k::D as i64, std::ptr::null(), 0, np(&dr.hnorm), np(&self.run.x),
+                             k::D as i64, n as i32, k::D as i32, EPS)
+        }, "ctx norm")?;
+        let mut bpos = vec![0i32; self.run.rows];
+        for i in 0..n {
+            bpos[i] = (pos0 + i as i64) as i32;
+        }
+        self.run.bpos.upload_async(0, &bpos, st).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+        self.run.bind_ring(st, ring)?;
+        for (li, l) in dr.layers.iter().enumerate() {
+            self.run.gemm_m(blas, n, &self.run.x, &l.kv, 2 * k::KVW, k::D, &self.run.qkv)?;
+            ck(unsafe {
+                k::glm_df_launch_ctx_kv(st.raw(), np(&self.run.qkv), np(&l.kn), np(&self.run.bpos), np(&self.run.rings),
+                                        li as i32, n as i32, EPS, THETA)
+            }, "ctx kv")?;
+        }
+        Ok(())
+    }
+
+    /// One block at `anchor_pos`: context folded, then embeddings of `[anchor, MASK x 7]` through
+    /// the five layers. `hn` is what the target's head scores. The bench's `embed_taps` + `pass`
+    /// is a different contract and is not this.
+    pub fn prepare(&self, st: &Stream, blas: &Blas, dr: &Drafter, lane: usize, anchor_pos: i64, anchor: i32,
+                   table: *const c_void, hidden: i32) -> Result<()> {
+        if self.streams != 1 || self.run.rows != BLOCK {
+            return Err(format!("dflash prepare is one block of {BLOCK}, not {} x {BLOCK}", self.streams).into());
+        }
+        self.ingest_until(st, blas, dr, lane, anchor_pos)?;
+        let plan = block_plan(anchor as u32, anchor_pos);
+        let trust = self.lanes.get(lane).map(|l| l.trust_lo.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+        let from = plan.from.max(trust);
+        let ids: Vec<i32> = plan.ids.iter().map(|&t| t as i32).collect();
+        self.ids.upload_async(0, &ids, st).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+        ck(unsafe {
+            tidelm_kernels::flash::flash_embed(st.raw(), self.ids.raw(), BLOCK as i32, table, hidden, 1, std::ptr::null(),
+                                               np(&self.run.x))
+        }, "embed")?;
+        let bseed = vec![0i64; BLOCK];
+        self.run.set_tables(st, &[plan.start], &[from], &plan.pos, &bseed)?;
+        let ring = self.lanes.get(lane).ok_or_else(|| format!("dflash lane {lane}"))?.ring.raw();
+        // `ring` is a copy of the device pointer; the borrow of `lanes` ended with the statement.
+        self.run.bind_ring(st, ring)?;
+        self.run.pass(st, blas, dr)
+    }
+
+    /// Top-16 of the target's fp32 head over the block, then the walk. `offset` is this rank's
+    /// first vocabulary row (0 on one box). Drafts are token ids.
+    pub fn score(&self, st: &Stream, dr: &Drafter, logits: *const c_void, vocab: usize, offset: usize, anchor: i32)
+                 -> Result<Vec<i32>> {
+        if vocab == 0 || vocab > VOCAB || offset.saturating_add(vocab) > VOCAB {
+            return Err(format!("dflash score: {vocab} columns at {offset}, the codebooks hold {VOCAB}").into());
+        }
+        ck(unsafe {
+            k::glm_df_launch_top16_part_f32(st.raw(), logits, self.run.rows as i32, vocab as i32, offset as i32,
+                                            np(&self.pv), np(&self.pi))
+        }, "top16")?;
+        let chunks = vocab.div_ceil(4096);
+        ck(unsafe {
+            k::glm_df_launch_top16_merge(st.raw(), np(&self.pv), np(&self.pi), self.run.rows as i32, chunks as i32,
+                                         np(&self.cand))
+        }, "top16 merge")?;
+        self.anchor(st, &[anchor])?;
+        self.walk(st, dr)?;
+        let picks = self.drafts(st)?;
+        if std::env::var("DF_CAND").as_deref() == Ok("1") {
+            let c = self.cand.download().map_err(|e| format!("dflash cand: {e}"))?;
+            // row 1 is the first drafted position. Layout is [rows][2][16]: ids, then f32 bits.
+            eprintln!("dflash candidates, row 1: {:?}", &c[32..48]);
+        }
+        if picks.iter().any(|&id| id < 0 || id as usize >= VOCAB) {
+            return Err(format!("dflash: draft ids {picks:?} are outside 0..{VOCAB}").into());
+        }
+        Ok(picks)
+    }
 }
 
 /// `b`'s pointer `n` elements in.
@@ -775,6 +960,54 @@ fn ck(rc: i32, what: &str) -> Result<()> {
 
 
 
+/// The mask token the block's rows 1..7 embed (`mask_token_id` in the drafter's config).
+pub const MASK: u32 = 154856;
+
+/// One draft block. Row 0 is the anchor at `anchor_pos`; rows 1..7 are `MASK` at the next
+/// positions. `from` is the first context key attention may read.
+pub struct BlockPlan {
+    pub ids: [u32; BLOCK],
+    pub pos: [i64; BLOCK],
+    pub start: i64,
+    pub from: i64,
+}
+
+pub fn block_plan(anchor: u32, anchor_pos: i64) -> BlockPlan {
+    let mut ids = [MASK; BLOCK];
+    ids[0] = anchor;
+    BlockPlan {
+        ids,
+        pos: std::array::from_fn(|t| anchor_pos + t as i64),
+        start: anchor_pos,
+        from: (anchor_pos - (WIN as i64 - 1)).max(0),
+    }
+}
+
+/// Context positions `[lo, hi)` to fold into the ring before a draft at `anchor_pos`.
+///
+/// `seeded_to < 0`, or a position that went backwards, refolds the last window: the ring does
+/// not hold this sequence. Otherwise only the positions not yet folded, and never a position
+/// the window has rotated past (attention does not read it, and the slot no longer holds it).
+/// `trust_lo` is the first position this sequence tapped; slots below it are not read.
+pub fn ingest_span(seeded_to: i64, anchor_pos: i64, trust_lo: i64) -> Option<(i64, i64)> {
+    if anchor_pos <= 0 {
+        return None;
+    }
+    let hi = anchor_pos;
+    let window_lo = (hi - WIN as i64).max(0);
+    let mut lo = if seeded_to < 0 || seeded_to > hi { window_lo } else { seeded_to.max(window_lo) };
+    if trust_lo > lo {
+        lo = trust_lo;
+    }
+    if lo >= hi { None } else { Some((lo, hi)) }
+}
+
+/// Where the next anchor sits after `n_acc` drafts were kept. The anchor itself advances one,
+/// then one more per kept draft: `set_pos(b.p + 1 + n_acc)`.
+pub fn next_anchor_pos(anchor_pos: i64, n_acc: i64) -> i64 {
+    anchor_pos + 1 + n_acc
+}
+
 /// The target layers DFlash2 reads, in tap-slot order (the checkpoint's `target_layer_ids`).
 /// They are captured **after** the layer's residual is written, which is not where this engine's
 /// DSpark hook reads: see docs/dflash2-drafter.md, "The tap is after the layer".
@@ -788,6 +1021,50 @@ pub fn tap_slot(l: usize) -> Option<usize> {
 /// A bf16 tensor from the checkpoint to the device. The drafter ships bf16 throughout, so a
 /// tensor of another dtype is an error rather than something to widen: a silently cast weight is
 /// how a drafter ends up scoring the wrong distribution.
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn the_block_is_the_anchor_then_masks_at_the_anchors_position() {
+        let p = block_plan(1001, 50);
+        assert_eq!(p.ids[0], 1001);
+        assert!(p.ids[1..].iter().all(|&t| t == MASK));
+        assert_eq!(p.pos, [50, 51, 52, 53, 54, 55, 56, 57]);
+        assert_eq!(p.start, 50);
+        // 50 - 2047 is negative, so the window starts at 0
+        assert_eq!(p.from, 0);
+        let far = block_plan(7, 3000);
+        assert_eq!(far.from, 3000 - 2047);
+        assert_eq!(far.start, 3000);
+    }
+
+    #[test]
+    fn context_is_the_window_then_only_the_new_tail() {
+        assert_eq!(ingest_span(-1, 100, 0), Some((0, 100)));
+        assert_eq!(ingest_span(-1, 5000, 0), Some((5000 - 2048, 5000)));
+        assert_eq!(ingest_span(100, 108, 0), Some((100, 108)));
+        assert_eq!(ingest_span(108, 108, 0), None);
+        assert_eq!(ingest_span(0, 0, 0), None);
+        // a new sequence whose position went backwards refolds its own window
+        assert_eq!(ingest_span(5000, 100, 0), Some((0, 100)));
+        // already folded through 100, drafting at 3000: the ring holds the old keys, and the
+        // window no longer holds positions before 3000 - 2048
+        assert_eq!(ingest_span(100, 3000, 0), Some((3000 - 2048, 3000)));
+        // a rewind kept the prefix at 9998 and the prefill only retapped from there. The slots
+        // below that may be an abandoned generation (p and p + WIN share a slot).
+        assert_eq!(ingest_span(-1, 10020, 9998), Some((9998, 10020)));
+    }
+
+    #[test]
+    fn the_next_anchor_is_one_past_the_kept_drafts() {
+        assert_eq!(next_anchor_pos(100, 0), 101);
+        assert_eq!(next_anchor_pos(100, 3), 104);
+        // the next fold is exactly the verify rows that were kept
+        assert_eq!(ingest_span(100, next_anchor_pos(100, 3), 0), Some((100, 104)));
+    }
+}
+
 fn bf16(ck: &tidelm_model::Checkpoint, name: &str) -> Result<DeviceBuffer<u16>> {
     let meta = ck.meta(name).map_err(|e| format!("{name}: {e}"))?;
     if meta.dtype != "BF16" {

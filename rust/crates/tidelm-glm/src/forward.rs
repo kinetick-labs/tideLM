@@ -848,7 +848,9 @@ impl Engine {
         self.st.synchronize()?;
         df.blk.run.set_tables(&df.own, starts, froms, bpos).map_err(|e| format!("dflash tables: {e}"))?;
         df.blk.seed_taps(&df.own, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
-        let picks = df.blk.round_bf16(&df.own, &df.blas, &df.dr, np(&self.act.logits), anchors)
+        // The target's head is `vl` wide (147,456 at world 1), not the drafter checkpoint's
+        // VOCAB: scoring the block over the wrong stride read 68 KB past the logits buffer.
+        let picks = df.blk.round_bf16(&df.own, &df.blas, &df.dr, np(&self.act.logits), anchors, self.vl)
             .map_err(|e| format!("dflash round: {e}"))?;
         df.own.synchronize()?;
         Ok(picks)
@@ -1791,7 +1793,7 @@ impl Engine {
             // DFlash2's taps: these layers' residuals, on the 8-row verify step only. `layer_pre`
             // delegates to flash_layer_pre when cfg.hc is set (the GLM-5.3-Flash path), which is
             // why the tap sits here, after mlp, rather than inside either of them.
-            if t == VERIFY_ROWS {
+            if t == VERIFY_ROWS && std::env::var("DF_NOTAP").is_err() {
                 if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
                     df.blk.run.tap(&self.st, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;
                 }

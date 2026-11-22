@@ -38,6 +38,10 @@ use tidelm_kernels::dflash::{D, KVW};
 
 
 /// Positions a draft block carries: `BLOCK` from the checkpoint (`block_size: 8`).
+extern "C" {
+    fn cudaDeviceSynchronize() -> i32;
+}
+
 pub const BLOCK: usize = tidelm_kernels::dflash::BLOCK;
 /// The drafter's backbone layers (`num_hidden_layers: 5`).
 pub const LAYERS: usize = 5;
@@ -439,10 +443,19 @@ impl Run {
                 // The shapes a failure happened on, once: a status 13 in the serving loop and not in
                 // the bench is a fact about this call, not about cublas.
                 if std::env::var("DF_DEBUG").is_ok() {
-                    eprintln!("dflash gemm failed: m={} n={} k={} ld={} x={:p} w={:p} y={:p}",
-                              self.rows, n, kk, kk, x.raw(), w.raw(), y.raw());
+                    // Is the refusal cublas's, or a poisoned context? An async fault from an earlier
+                    // kernel surfaces exactly like this: the call that reports it is not the call
+                    // that caused it.
+                    let sync = unsafe { cudaDeviceSynchronize() };
+                    eprintln!("dflash gemm failed: m={} n={} k={} ld={} x={:p} w={:p} y={:p} device-sync={}",
+                              self.rows, n, kk, kk, x.raw(), w.raw(), y.raw(), sync);
                 }
                 e.into()
+            })
+            .inspect(|_| {
+                if std::env::var("DF_DEBUG").as_deref() == Ok("2") {
+                    eprintln!("dflash gemm ok: n={n} k={kk}");
+                }
             })
     }
 
@@ -519,9 +532,9 @@ impl Block {
 
     /// The candidate list from **bf16** logits, which is what the engine's head leaves in
     /// `act.logits` (`glm_argmax_bf16` reads the same buffer). Same chunked top-16, same layout.
-    pub fn candidates_bf16(&self, st: &Stream, logits: *const c_void) -> Result<()> {
+    pub fn candidates_bf16(&self, st: &Stream, logits: *const c_void, vocab: usize) -> Result<()> {
         ck(unsafe {
-            k::glm_df_launch_top16_part(st.raw(), logits, self.run.rows as i32, VOCAB as i32, 0, np(&self.pv), np(&self.pi))
+            k::glm_df_launch_top16_part(st.raw(), logits, self.run.rows as i32, vocab as i32, 0, np(&self.pv), np(&self.pi))
         }, "top16 part bf16")?;
         ck(unsafe {
             k::glm_df_launch_top16_merge(st.raw(), np(&self.pv), np(&self.pi), self.run.rows as i32, self.chunks as i32,
@@ -530,14 +543,14 @@ impl Block {
     }
 
     /// `round` over bf16 logits (the engine's own buffer).
-    pub fn round_bf16(&self, st: &Stream, blas: &Blas, dr: &Drafter, logits: *const c_void, anchors: &[i32])
-                      -> Result<Vec<i32>> {
+    pub fn round_bf16(&self, st: &Stream, blas: &Blas, dr: &Drafter, logits: *const c_void, anchors: &[i32],
+                      vocab: usize) -> Result<Vec<i32>> {
         if anchors.len() != self.streams {
             return Err(format!("round: {} anchors for {} streams", anchors.len(), self.streams).into());
         }
         self.run.embed_taps(st, blas, dr)?;
         self.run.pass(st, blas, dr)?;
-        self.candidates_bf16(st, logits)?;
+        self.candidates_bf16(st, logits, vocab)?;
         self.anchor(st, anchors)?;
         self.walk(st, dr)?;
         self.drafts(st)

@@ -4172,7 +4172,7 @@ impl Engine {
         let df = self.dflash.as_ref().expect("checked above");
         df.blk.run.set_tables(st, &[p0], &[from], &bpos).map_err(|e| format!("dflash tables: {e}"))?;
         df.blk.seed_taps(st, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
-        let picks = df.blk.round_bf16(st, &df.blas, &df.dr, logits, &anchors).map_err(|e| format!("dflash: {e}"))?;
+        let picks = df.blk.round_bf16(st, &df.blas, &df.dr, logits, &anchors, tidelm_dflash::VOCAB).map_err(|e| format!("dflash: {e}"))?;
         // picks is [step][stream], step-major
         let mut out = vec![Vec::with_capacity(tidelm_dflash::BLOCK - 1); reqs.len()];
         for step in 0..(tidelm_dflash::BLOCK - 1) {

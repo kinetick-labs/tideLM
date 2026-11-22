@@ -101,15 +101,18 @@ extern "C" __global__ void glm_df_block_qkv(const __nv_bfloat16* __restrict__ qk
 // Context rows' keys and values (k | v) normed, rotated at pos[r], into rings[r] at slot pos % WIN
 // of `layer`. grid (rows, KVH).
 extern "C" __global__ void glm_df_ctx_kv(const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ kn,
-                                         const long long* __restrict__ pos, const uint64_t* __restrict__ rings, int layer,
+                                         const int* __restrict__ pos, const uint64_t* __restrict__ rings, int layer,
                                          float eps, float theta) {
     __shared__ float red[2];
     const int r = blockIdx.x, kh = blockIdx.y;
+    // `rings` holds one ring a stream, and rows are stream-major (BLOCK a stream): indexing it by
+    // the row read past its end as soon as a block had more than one stream's worth of rows.
+    const int s = r / BLOCK;
     const long long p = pos[r];
     const int slot = (int)(p % WIN);
     const __nv_bfloat16* row = kv + (long long)r * 2 * KVW;
-    normRope(row + kh * HD, kn, eps, p, theta, ringK(rings[r], layer) + (long long)slot * KVW + kh * HD, red);
-    __nv_bfloat16* vo = ringV(rings[r], layer) + (long long)slot * KVW + kh * HD;
+    normRope(row + kh * HD, kn, eps, p, theta, ringK(rings[s], layer) + (long long)slot * KVW + kh * HD, red);
+    __nv_bfloat16* vo = ringV(rings[s], layer) + (long long)slot * KVW + kh * HD;
     vo[threadIdx.x] = row[KVW + kh * HD + threadIdx.x];
     vo[threadIdx.x + 64] = row[KVW + kh * HD + threadIdx.x + 64];
 }
@@ -407,7 +410,7 @@ extern "C" int glm_df_launch_block_qkv(cudaStream_t st, const void* qkv, int ldq
 
 extern "C" int glm_df_launch_ctx_kv(cudaStream_t st, const void* kv, const void* kn, const void* pos, const void* rings,
                                     int layer, int rows, float eps, float theta) {
-    glm_df_ctx_kv<<<dim3(rows, KVH), 64, 0, st>>>((const __nv_bfloat16*)kv, (const __nv_bfloat16*)kn, (const long long*)pos,
+    glm_df_ctx_kv<<<dim3(rows, KVH), 64, 0, st>>>((const __nv_bfloat16*)kv, (const __nv_bfloat16*)kn, (const int*)pos,
                                                   (const uint64_t*)rings, layer, eps, theta);
     return df_check();
 }

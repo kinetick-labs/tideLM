@@ -321,18 +321,30 @@ pub struct Dflash {
     /// an interaction with the engine's handle state, not with the shapes.
     pub own: Stream,
     pub blas: Blas,
+    /// Rounds in a row that produced no accepted draft. At 8 the drafter stands down: one that
+    /// accepts nothing still pays the verify pass' eight rows and returns one token, which measured
+    /// 3,7x slower than not drafting at all (5,17 against 19,38 tok/s). Standing down recovers that
+    /// without a restart; only a new process brings it back, which is honest -- there is no evidence
+    /// that waiting helps a drafter whose input is empty.
+    miss: std::sync::atomic::AtomicU32,
+    /// Passes logged by the row-count probe, so one served request names the truth once.
+    logged: std::sync::atomic::AtomicU32,
 }
 
 impl Dflash {
-    /// No GEMM handle of its own: the engine already has one bound to this stream (`self.blas`),
-    /// and a second handle on the same stream fails inside cuBLAS (status 13) rather than queueing.
+    /// Its own stream and a GEMM handle bound to it. The engine's handle was tried first and the
+    /// round's last projection failed with cublas status 13 there -- which turned out to be an
+    /// out-of-bounds read in ctx_kv landing on the next checked call, not the handle. The private
+    /// pair stays because removing it faulted glm_df_select; see a2274c5 and b61cab6.
     pub fn open(dir: &Path, rows: usize) -> Result<Self> {
         let ck = tidelm_model::Checkpoint::open(dir)?;
         let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
         let blk = tidelm_dflash::Block::new(&dr, rows).map_err(|e| format!("dflash: {e}"))?;
         let own = Stream::new()?;
         let blas = Blas::new(own.raw()).map_err(|e| format!("dflash: {e}"))?;
-        Ok(Dflash { dr, blk, own, blas })
+        Ok(Dflash { dr, blk, own, blas,
+                    miss: std::sync::atomic::AtomicU32::new(0),
+                    logged: std::sync::atomic::AtomicU32::new(0) })
     }
 }
 
@@ -842,6 +854,9 @@ impl Engine {
             Some(d) => d,
             None => return Ok(Vec::new()),
         };
+        if df.miss.load(std::sync::atomic::Ordering::Relaxed) >= 8 {
+            return Ok(Vec::new());
+        }
         // The engine's loop is serial here: join it, run the round on the drafter's own stream, and
         // join back. Two syncs a round buy isolation from the engine's cublas handle state, which is
         // what the status 13 was.
@@ -854,6 +869,20 @@ impl Engine {
             .map_err(|e| format!("dflash round: {e}"))?;
         df.own.synchronize()?;
         Ok(picks)
+    }
+
+    /// One round's outcome, so the drafter can stand down when it is costing without returning.
+    pub fn note_dflash(&self, accepted: usize) {
+        let Some(df) = self.dflash.as_ref() else { return };
+        use std::sync::atomic::Ordering::Relaxed;
+        if accepted == 0 {
+            let m = df.miss.fetch_add(1, Relaxed) + 1;
+            if m == 8 {
+                eprintln!("dflash: 8 rounds without an accepted draft; drafting off for this process");
+            }
+        } else {
+            df.miss.store(0, Relaxed);
+        }
     }
 
     /// The host lut / allowed mirrors to the device (stream-ordered).
@@ -1793,6 +1822,17 @@ impl Engine {
             // DFlash2's taps: these layers' residuals, on the 8-row verify step only. `layer_pre`
             // delegates to flash_layer_pre when cfg.hc is set (the GLM-5.3-Flash path), which is
             // why the tap sits here, after mlp, rather than inside either of them.
+            // Row-count probe: `t == VERIFY_ROWS` is the tap's whole condition, and a tap that never
+            // fires leaves the block reading whatever `cin` held at allocation. Log the first passes'
+            // row counts once, at layer 0, so one served request names the truth.
+            if l == 0 {
+                if let Some(df) = self.dflash.as_ref() {
+                    let n = df.logged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 12 {
+                        eprintln!("dflash pass: t={t} target={VERIFY_ROWS}");
+                    }
+                }
+            }
             if t == VERIFY_ROWS {
                 if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
                     df.blk.run.tap(&self.st, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;

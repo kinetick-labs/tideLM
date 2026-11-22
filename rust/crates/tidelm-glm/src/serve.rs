@@ -1232,7 +1232,11 @@ impl Server {
                 blocks[k].qs = vec![None; blocks[k].drafts.len()];
             }
         }
-        let dspark = self.eng.has_drafter();
+        // Not both: DFlash2's seven picks and the MTP chain's seven compose a fifteen-row verify
+        // pass, which is what the row-count probe found (t=15 eight times, t=8 only twice). The tap's
+        // condition is t == VERIFY_ROWS, so the block's input came from those two stray passes and
+        // every other round drafted from stale residuals. One drafter a lane, chosen by attachment.
+        let dspark = self.eng.has_drafter() && self.eng.dflash.is_none();
         if dspark {
             for k in 0..blocks.len() {
                 if blocks[k].plain || blocks[k].copy {
@@ -1459,6 +1463,7 @@ impl Server {
                 st.rounds += 1;
                 st.drafted += nd;
                 st.accepted += n_acc;
+                self.eng.note_dflash(n_acc);
                 if b.long {
                     st.long_copies += 1;
                 }

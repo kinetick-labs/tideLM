@@ -1833,7 +1833,13 @@ impl Engine {
                     }
                 }
             }
-            if t == VERIFY_ROWS {
+            // A verify pass carries one block per lane, packed back to back (`row0 += 1 + nd` in
+            // serve.rs), so its width is the sum over lanes -- 15 for two blocks of eight and seven,
+            // which is why `t == VERIFY_ROWS` was true twice a request and never on the round that
+            // mattered. The drafter reads the first block's rows, and this hook taps rows 0..8 of the
+            // pass: correct while the drafting lane is the first block, which is what `one lane at a
+            // time` buys. A prefill chunk is wider than two blocks and stays out by the upper bound.
+            if t >= VERIFY_ROWS && t <= 2 * VERIFY_ROWS {
                 if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
                     df.blk.run.tap(&self.st, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;
                 }

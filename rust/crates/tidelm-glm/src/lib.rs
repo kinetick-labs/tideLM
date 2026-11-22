@@ -6,6 +6,7 @@ pub mod ablit;
 pub mod adapt;
 pub mod arena;
 pub mod config;
+pub mod dflash;
 pub mod flash;
 pub mod inkling;
 pub mod inkling_draft;

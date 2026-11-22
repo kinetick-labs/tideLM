@@ -492,6 +492,10 @@ pub struct Engine {
     ink: Option<inkling_fwd::InkState>,
     /// GLM-5.3-Flash's image input (flash_image; None: off)
     pub vis: Option<crate::flash_image::VisionState>,
+    /// GLM_DRAFTER=dflash2: the DFlash2 drafter's weights. This is the crate the GLM serving path
+    /// builds (`glm_main.rs` imports it), so it is where the drafter has to live -- the same work
+    /// in tidelm-engine's Model compiled and never ran.
+    pub dflash: Option<tidelm_dflash::Drafter>,
 }
 
 fn np<T: Copy>(b: &DeviceBuffer<T>) -> *mut c_void {
@@ -685,7 +689,7 @@ impl Engine {
         let opt_chunk = opt.chunk;
 
         let moe_layers_res = moe_layers.clone();
-        let engine = Engine {
+        let mut engine = Engine {
             lut: DeviceBuffer::from_slice(&lut_h)?,
             allowed: DeviceBuffer::from_slice(&allowed_h)?,
             mtp_lut: DeviceBuffer::from_slice(&mtp_lut)?,
@@ -782,8 +786,23 @@ impl Engine {
             fl,
             ink,
             vis: None,
+            dflash: None,
         };
         engine.st.synchronize()?;
+        // GLM_DRAFTER=dflash2: DFlash2's own checkpoint, attached once, after the model's weights
+        // are on the device. Printed, not silent: with --depth also on, DSpark drafts too, and the
+        // two are indistinguishable from outside by their accept rates alone.
+        if std::env::var("GLM_DRAFTER").as_deref() == Ok("dflash2") {
+            let dir = std::env::var_os("GLM_DRAFTER_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| model_dir.join("../glm53-dflash2"));
+            let ck = tidelm_model::Checkpoint::open(&dir)?;
+            let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
+            println!("boot: DFlash2 drafter {} ({:.2} GiB, {} layers, block {})",
+                     dir.display(), dr.nbytes() as f64 / (1u64 << 30) as f64,
+                     tidelm_dflash::LAYERS, tidelm_dflash::BLOCK);
+            engine.dflash = Some(dr);
+        }
         Ok(engine)
     }
 

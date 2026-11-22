@@ -157,6 +157,7 @@ fn main() {
         objs[2].to_str().unwrap(),
         objs[3].to_str().unwrap(),
         objs[4].to_str().unwrap(),
+        objs[5].to_str().unwrap(),
     ]));
 
     println!("cargo:rustc-link-search=native={}", out.display());

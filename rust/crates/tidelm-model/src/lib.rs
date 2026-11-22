@@ -43,7 +43,28 @@ impl WeightIndex {
         struct Index {
             weight_map: HashMap<String, String>,
         }
-        let raw = std::fs::read(model_dir.join("model.safetensors.index.json"))?;
+        // A sharded checkpoint carries the map; a single-file one (`model.safetensors`, as the
+        // published drafters ship) does not, and its header already names every tensor -- so the map
+        // is read from there instead of requiring a file the publisher never wrote.
+        let index_path = model_dir.join("model.safetensors.index.json");
+        if !index_path.exists() {
+            let single = model_dir.join("model.safetensors");
+            let mut f = std::fs::File::open(&single)?;
+            let mut len = [0u8; 8];
+            std::io::Read::read_exact(&mut f, &mut len)?;
+            let n = u64::from_le_bytes(len) as usize;
+            let mut head = vec![0u8; n];
+            std::io::Read::read_exact(&mut f, &mut head)?;
+            let tensors: HashMap<String, serde_json::Value> = serde_json::from_slice(&head)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let weight_map = tensors
+                .into_iter()
+                .filter(|(k, _)| k != "__metadata__")
+                .map(|(k, _)| (k, "model.safetensors".to_string()))
+                .collect();
+            return Ok(WeightIndex { model_dir: model_dir.to_path_buf(), weight_map });
+        }
+        let raw = std::fs::read(&index_path)?;
         let index: Index = serde_json::from_slice(&raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(WeightIndex { model_dir: model_dir.to_path_buf(), weight_map: index.weight_map })

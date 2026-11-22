@@ -76,7 +76,8 @@ fn main() -> Result<()> {
     let starts = vec![0i64; run.streams];
     let froms = vec![0i64; run.streams];
     let bpos: Vec<i64> = (0..rows).map(|r| r as i64).collect();
-    run.set_tables(&st, &starts, &froms, &bpos)?;
+    // bseed is the BLOCK-wide seed table, bpos is per row: the length check catches mixing them.
+    run.set_tables(&st, &starts, &froms, &bpos, &bpos[..tidelm_dflash::BLOCK])?;
 
     let blas = Blas::new(st.raw())?;
     // Warm: the weights' first touch is 2.2 GB of DRAM.

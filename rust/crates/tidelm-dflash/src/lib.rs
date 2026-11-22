@@ -482,6 +482,29 @@ impl Block {
         })
     }
 
+    /// Fill the ring from the tap rows themselves: each tapped layer's hidden projected through
+    /// that layer's `k|v` and written at the row's position, which is `ctx_kv`'s job.
+    ///
+    /// This is the *short* seed: `BLOCK` keys, the rows the taps hold. TensorFold seeds `WIN`
+    /// (2048) keys by running the drafter's own context over the prompt's tail, which needs the
+    /// last 2048 rows' residual at those five layers kept from prefill -- the next piece, and the
+    /// reason a draft's acceptance will read low until it exists.
+    pub fn seed_taps(&self, st: &Stream, blas: &Blas, dr: &Drafter) -> Result<()> {
+        let (m, d) = (self.run.rows, k::D);
+        for (li, l) in dr.layers.iter().enumerate() {
+            // taps slot li of every row, stride 5 * D, into the layer's k|v [rows][2 * KVW]
+            blas.gemm_rm(m, 2 * k::KVW, d, Mat { ptr: at(&self.run.cin, li * d), ty: R_16BF, ld: (5 * d) as i64 },
+                         Mat { ptr: l.kv.raw(), ty: R_16BF, ld: d as i64 }, true, np(&self.run.qkv), R_16BF,
+                         (2 * k::KVW) as i64)
+                .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+            ck(unsafe {
+                k::glm_df_launch_ctx_kv(st.raw(), np(&self.run.qkv), np(&l.kn), np(&self.run.bpos), np(&self.run.rings),
+                                        li as i32, m as i32, EPS, THETA)
+            }, "ctx_kv")?;
+        }
+        Ok(())
+    }
+
     /// The candidate list from **bf16** logits, which is what the engine's head leaves in
     /// `act.logits` (`glm_argmax_bf16` reads the same buffer). Same chunked top-16, same layout.
     pub fn candidates_bf16(&self, st: &Stream, logits: *const c_void) -> Result<()> {

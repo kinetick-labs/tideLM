@@ -296,6 +296,66 @@ impl Run {
         })
     }
 
+    /// A run over `rows` consecutive positions of a window, all sharing ONE ring. The block's own
+    /// run gives a ring a stream and a stream BLOCK rows (`ring[s]`, s = r / BLOCK), which is right
+    /// for a verify pass -- eight rows, one context -- and wrong for the seed: 512 rows there are
+    /// 64 groups over a single ring, the 2048 keys of the window, not 64 rings and 2,5 GiB.
+    ///
+    /// Nothing new is allocated for K/V: `set_seed_tables` points every group at the ring the block
+    /// already reads, so the seed writes exactly what the next attention will look up.
+    pub fn new_seed(dr: &Drafter, rows: usize) -> Result<Self> {
+        let (m, groups) = (rows, rows / BLOCK);
+        Ok(Self {
+            cin: DeviceBuffer::zeroed(m * 5 * k::D)?,
+            x: DeviceBuffer::zeroed(m * k::D)?,
+            y: DeviceBuffer::zeroed(m * k::D)?,
+            y2: DeviceBuffer::zeroed(m * k::D)?,
+            dynw: DeviceBuffer::zeroed(m * DYN)?,
+            qkv: DeviceBuffer::zeroed(m * QKV)?,
+            q: DeviceBuffer::zeroed(m * k::QH * k::HD)?,
+            kb: DeviceBuffer::zeroed(m * k::KVW)?,
+            vb: DeviceBuffer::zeroed(m * k::KVW)?,
+            att: DeviceBuffer::zeroed(m * k::QH * k::HD)?,
+            a: DeviceBuffer::zeroed(m * k::D)?,
+            gu: DeviceBuffer::zeroed(m * GU)?,
+            act: DeviceBuffer::zeroed(m * FF)?,
+            hn: DeviceBuffer::zeroed(m * k::D)?,
+            g: DeviceBuffer::zeroed(m * RANK)?,
+            pm: DeviceBuffer::zeroed(m * k::QH * k::CH)?,
+            pl: DeviceBuffer::zeroed(m * k::QH * k::CH)?,
+            pacc: DeviceBuffer::zeroed(m * k::QH * k::CH * k::HD)?,
+            ring: DeviceBuffer::zeroed(1)?,
+            rings: DeviceBuffer::zeroed(groups)?,
+            starts: DeviceBuffer::zeroed(groups)?,
+            froms: DeviceBuffer::zeroed(groups)?,
+            bpos: DeviceBuffer::zeroed(m)?,
+            bseed: DeviceBuffer::zeroed(BLOCK)?,
+            win: DeviceBuffer::zeroed(1)?,
+            win_rows: std::sync::atomic::AtomicUsize::new(0),
+            rows,
+            streams: groups,
+            ring_row: dr.ring_row,
+        })
+    }
+
+    /// `base` is the position of row 0; group g starts at `base + g * BLOCK` and may read the ring
+    /// from `lo`. Every group's `rings` entry is the same pointer: one ring, many rows.
+    pub fn set_seed_tables(&self, st: &Stream, ring: *mut c_void, base: i64, lo: i64) -> Result<()> {
+        let g = self.streams;
+        let starts: Vec<i64> = (0..g).map(|s| base + (s * BLOCK) as i64).collect();
+        let froms: Vec<i64> = vec![lo; g];
+        let rings: Vec<u64> = vec![ring as u64; g];
+        let bpos: Vec<i32> = (0..self.rows).map(|r| (base + r as i64) as i32).collect();
+        let up = |buf: &DeviceBuffer<i64>, v: &[i64]| -> Result<()> {
+            buf.upload_async(0, v, st).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+        };
+        up(&self.starts, &starts)?;
+        up(&self.froms, &froms)?;
+        self.rings.upload_async(0, &rings, st).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+        self.bpos.upload_async(0, &bpos, st).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+        Ok(())
+    }
+
     /// The tables a pass reads: per stream its position (the anchor's), the start of its context
     /// in the ring and how far back the window may look; and per row its position.
     /// `bseed` is where the short seed writes its keys -- the BLOCK positions *before* the anchor,
@@ -498,6 +558,10 @@ pub struct Block {
     /// `[BLOCK - 1][streams]`: which row each step reads its candidates from.
     pub rsel: DeviceBuffer<i32>,
     pub chunks: usize,
+    /// Last position the window was seeded at. The seed costs a drafter pass over the window; it
+    /// grows by a token or three a round, so re-seeding every 64 positions is enough to keep it
+    /// current at a fraction of a millisecond a step.
+    pub seeded_to: std::sync::atomic::AtomicI64,
     pub streams: usize,
 }
 
@@ -519,6 +583,7 @@ impl Block {
             chain: DeviceBuffer::zeroed(BLOCK * streams)?,
             rsel: DeviceBuffer::from_slice(&rsel)?,
             chunks,
+            seeded_to: std::sync::atomic::AtomicI64::new(-1),
             streams,
         })
     }
@@ -544,6 +609,49 @@ impl Block {
             }, "ctx_kv")?;
         }
         Ok(())
+    }
+
+    /// Seed the drafter's ring from the captured window: every BLOCK rows of the sequence's tail gets
+    /// its own pass over the block's ring, in position order, so the keys the next attention looks up
+    /// are the prompt's own state and not the eight rows of the verify step.
+    ///
+    /// Groups of BLOCK, not one wide pass: the block kernels give a ring a stream and a stream BLOCK
+    /// rows, so a 512-row pass would allocate 64 rings (2,5 GiB). This way nothing is allocated at
+    /// all -- the run and its ring already exist -- and the cost is a drafter pass a BLOCK rows.
+    pub fn seed_window(&self, st: &Stream, blas: &Blas, dr: &Drafter, p0: i64) -> Result<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let captured = self.run.win_rows.load(Relaxed) as i64;
+        let want = p0.min(WIN as i64).min(captured);
+        if want < BLOCK as i64 {
+            return Ok(0);
+        }
+        let last = self.seeded_to.load(Relaxed);
+        if last >= 0 && p0 - last < 64 {
+            return Ok(0);
+        }
+        let mut base = 0i64;
+        let mut seeded = 0usize;
+        while base + BLOCK as i64 <= want {
+            // the window's rows in that slice, straight into cin
+            self.run.cin.copy_from(0, &self.run.win, base as usize * 5 * k::D, BLOCK * 5 * k::D, st)
+                .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+            let starts = [base];
+            let froms = [0i64];
+            let bpos: Vec<i64> = (0..BLOCK as i64).map(|i| base + i).collect();
+            self.run.set_tables(st, &starts, &froms, &bpos, &bpos[..BLOCK])?;
+            self.run.embed_taps(st, blas, dr).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+            self.run.pass(st, blas, dr).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+            for (li, l) in dr.layers.iter().enumerate() {
+                ck(unsafe {
+                    k::glm_df_launch_ctx_kv(st.raw(), np(&self.run.qkv), np(&l.kn), np(&self.run.bpos),
+                                            np(&self.run.rings), li as i32, BLOCK as i32, EPS, THETA)
+                }, "ctx_kv seed")?;
+            }
+            base += BLOCK as i64;
+            seeded += BLOCK;
+        }
+        self.seeded_to.store(p0, Relaxed);
+        Ok(seeded)
     }
 
     /// The candidate list from **bf16** logits, which is what the engine's head leaves in

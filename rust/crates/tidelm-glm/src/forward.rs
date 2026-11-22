@@ -861,8 +861,17 @@ impl Engine {
         // join back. Two syncs a round buy isolation from the engine's cublas handle state, which is
         // what the status 13 was.
         self.st.synchronize()?;
+        // The window first: the captured residuals of the sequence so far, a BLOCK rows a pass, so the
+        // ring holds the prompt's own state. Falls back to the block's eight rows while the capture
+        // is still shorter than a block.
+        let seeded = df.blk.seed_window(&df.own, &df.blas, &df.dr, starts[0])
+            .map_err(|e| format!("dflash window seed: {e}"))?;
+        if seeded == 0 {
+            df.blk.run.set_tables(&df.own, starts, froms, bpos, bseed).map_err(|e| format!("dflash tables: {e}"))?;
+            df.blk.seed_taps(&df.own, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
+        }
+        // The seed moved the tables; the block's round needs its own back.
         df.blk.run.set_tables(&df.own, starts, froms, bpos, bseed).map_err(|e| format!("dflash tables: {e}"))?;
-        df.blk.seed_taps(&df.own, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
         // The target's head is `vl` wide (147,456 at world 1), not the drafter checkpoint's
         // VOCAB: scoring the block over the wrong stride read 68 KB past the logits buffer.
         let picks = df.blk.round_bf16(&df.own, &df.blas, &df.dr, np(&self.act.head), anchors, self.vl)

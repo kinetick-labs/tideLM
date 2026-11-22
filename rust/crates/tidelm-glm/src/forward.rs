@@ -935,7 +935,8 @@ impl Engine {
             return Ok(());
         }
         df.blk.tap_lanes(&self.st, np(&self.act.h), np(&self.act.pos), np(&self.act.rlane), slot, t)
-            .map_err(|e| format!("dflash tap layer {closed}: {e}"))
+            .map_err(|e| format!("dflash tap layer {closed}: {e}"))?;
+        Ok(())
     }
 
     /// One round's outcome, so the drafter can stand down when it is costing without returning.

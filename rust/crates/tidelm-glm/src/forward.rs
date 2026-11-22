@@ -311,6 +311,24 @@ pub struct MtpRows<'a> {
     pub pos0: usize,
 }
 
+/// DFlash2 as the GLM engine holds it: the checkpoint's weights, one block's buffers (`VERIFY_ROWS`
+/// rows), and the GEMM handle they use. Per-model, not per-request.
+pub struct Dflash {
+    pub dr: tidelm_dflash::Drafter,
+    pub blk: tidelm_dflash::Block,
+}
+
+impl Dflash {
+    /// No GEMM handle of its own: the engine already has one bound to this stream (`self.blas`),
+    /// and a second handle on the same stream fails inside cuBLAS (status 13) rather than queueing.
+    pub fn open(dir: &Path, rows: usize) -> Result<Self> {
+        let ck = tidelm_model::Checkpoint::open(dir)?;
+        let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
+        let blk = tidelm_dflash::Block::new(&dr, rows).map_err(|e| format!("dflash: {e}"))?;
+        Ok(Dflash { dr, blk })
+    }
+}
+
 pub struct Engine {
     pub cfg: GlmConfig,
     pub opt: Options,
@@ -495,7 +513,7 @@ pub struct Engine {
     /// GLM_DRAFTER=dflash2: the DFlash2 drafter's weights. This is the crate the GLM serving path
     /// builds (`glm_main.rs` imports it), so it is where the drafter has to live -- the same work
     /// in tidelm-engine's Model compiled and never ran.
-    pub dflash: Option<tidelm_dflash::Drafter>,
+    pub dflash: Option<Dflash>,
 }
 
 fn np<T: Copy>(b: &DeviceBuffer<T>) -> *mut c_void {
@@ -796,18 +814,32 @@ impl Engine {
             let dir = std::env::var_os("GLM_DRAFTER_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| model_dir.join("../glm53-dflash2"));
-            let ck = tidelm_model::Checkpoint::open(&dir)?;
-            let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
-            println!("boot: DFlash2 drafter {} ({:.2} GiB, {} layers, block {})",
-                     dir.display(), dr.nbytes() as f64 / (1u64 << 30) as f64,
-                     tidelm_dflash::LAYERS, tidelm_dflash::BLOCK);
-            engine.dflash = Some(dr);
+            let df = Dflash::open(&dir, VERIFY_ROWS)?;
+            println!("boot: DFlash2 drafter {} ({:.2} GiB, {} layers, block {}, {} rows)",
+                     dir.display(), df.dr.nbytes() as f64 / (1u64 << 30) as f64,
+                     tidelm_dflash::LAYERS, tidelm_dflash::BLOCK, VERIFY_ROWS);
+            engine.dflash = Some(df);
         }
         Ok(engine)
     }
 
     pub fn stream(&self) -> &Stream {
         &self.st
+    }
+
+    /// DFlash2's seven drafts for a lane: the block's tables, the ring seeded from the taps the
+    /// last verify step captured, one round against the target's own head. Empty when no drafter
+    /// is attached, so the caller's loop needs no second condition.
+    pub fn dflash_drafts(&self, starts: &[i64], froms: &[i64], bpos: &[i64], anchors: &[i32]) -> Result<Vec<i32>> {
+        let df = match self.dflash.as_ref() {
+            Some(d) => d,
+            None => return Ok(Vec::new()),
+        };
+        df.blk.run.set_tables(&self.st, starts, froms, bpos).map_err(|e| format!("dflash tables: {e}"))?;
+        df.blk.seed_taps(&self.st, &self.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
+        let picks = df.blk.round_bf16(&self.st, &self.blas, &df.dr, np(&self.act.logits), anchors)
+            .map_err(|e| format!("dflash round: {e}"))?;
+        Ok(picks)
     }
 
     /// The host lut / allowed mirrors to the device (stream-ordered).
@@ -1744,6 +1776,14 @@ impl Engine {
         for l in 0..self.cfg.layers {
             self.layer_pre(l, t, prefill)?;
             self.mlp(l, t, prefill)?;
+            // DFlash2's taps: these layers' residuals, on the 8-row verify step only. `layer_pre`
+            // delegates to flash_layer_pre when cfg.hc is set (the GLM-5.3-Flash path), which is
+            // why the tap sits here, after mlp, rather than inside either of them.
+            if t == VERIFY_ROWS {
+                if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
+                    df.blk.run.tap(&self.st, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;
+                }
+            }
         }
         self.prefetch_join()?;
         self.final_norm(t)

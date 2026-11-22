@@ -1204,6 +1204,25 @@ impl Server {
         // cache row alone), the next ones the lanes whose chain goes on
         // Inkling 2: one block pass of the DSpark drafter a lane gives its 7 drafts at once (greedy:
         // q is a point mass, as a copy's), kept while the gate holds; no MTP layer, no chain of passes
+        // DFlash2: one block round gives every non-plain, non-copy lane its drafts, scored by the
+        // target's own head over the same rows the last verify step ran. Beside DSpark's branch
+        // rather than inside it: DSpark drafts for Inkling 2, this for GLM-5.3-Flash, and the
+        // verification that follows is the same code.
+        if self.eng.dflash.is_some() {
+            for k in 0..blocks.len() {
+                if blocks[k].plain || blocks[k].copy {
+                    continue;
+                }
+                let p0 = blocks[k].p as i64 + 1;
+                let from = (p0 - (tidelm_dflash::WIN as i64 - 1)).max(0);
+                let bpos: Vec<i64> = (0..tidelm_dflash::BLOCK).map(|i| p0 + i as i64).collect();
+                let anchor = runs[blocks[k].i].anchor as i32;
+                let picks = self.eng.dflash_drafts(&[p0], &[from], &bpos, &[anchor])?;
+                let dmax = blocks[k].dmax;
+                blocks[k].drafts = picks.into_iter().take(dmax).map(|d| d as u32).collect();
+                blocks[k].qs = vec![None; blocks[k].drafts.len()];
+            }
+        }
         let dspark = self.eng.has_drafter();
         if dspark {
             for k in 0..blocks.len() {

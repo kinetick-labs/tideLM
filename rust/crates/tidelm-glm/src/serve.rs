@@ -1275,7 +1275,16 @@ impl Server {
                 }
             }
         }
-        let mtp_lanes: Vec<usize> = if dspark { vec![] } else { (0..blocks.len()).filter(|&k| !blocks[k].plain).collect() };
+        // A lane gets one drafter. This line is where DFlash2 lost its acceptance: with the MTP
+        // chain still running on the same lane, `drafts` held fourteen entries -- MTP's seven first
+        // -- and the acceptance loop stops at the first mismatch, so DFlash2's chain was never read.
+        // The round log is what showed it: drafts [8, 0, 13, 4, 8, 0, 0, 1001, 1002, ...] against a
+        // target starting at 1001, matching five in a row from entry seven on.
+        let mtp_lanes: Vec<usize> = if dspark || self.eng.dflash.is_some() {
+            vec![]
+        } else {
+            (0..blocks.len()).filter(|&k| !blocks[k].plain).collect()
+        };
         if !mtp_lanes.is_empty() {
             let logits = mtp_lanes.iter().any(|&k| !blocks[k].copy);
             if self.eng.has_draft_list() {

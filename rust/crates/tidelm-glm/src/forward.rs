@@ -1793,11 +1793,8 @@ impl Engine {
             // DFlash2's taps: these layers' residuals, on the 8-row verify step only. `layer_pre`
             // delegates to flash_layer_pre when cfg.hc is set (the GLM-5.3-Flash path), which is
             // why the tap sits here, after mlp, rather than inside either of them.
-            if t == VERIFY_ROWS && std::env::var("DF_NOTAP").is_err() {
+            if t == VERIFY_ROWS {
                 if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
-                    if std::env::var("DF_TAPLOG").is_ok() {
-                        eprintln!("dflash tap layer {l} slot {slot} t {t}");
-                    }
                     df.blk.run.tap(&self.st, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;
                 }
             }

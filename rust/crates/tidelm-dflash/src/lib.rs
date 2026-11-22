@@ -38,10 +38,6 @@ use tidelm_kernels::dflash::{D, KVW};
 
 
 /// Positions a draft block carries: `BLOCK` from the checkpoint (`block_size: 8`).
-extern "C" {
-    fn cudaDeviceSynchronize() -> i32;
-}
-
 pub const BLOCK: usize = tidelm_kernels::dflash::BLOCK;
 /// The drafter's backbone layers (`num_hidden_layers: 5`).
 pub const LAYERS: usize = 5;
@@ -442,21 +438,9 @@ impl Run {
             .map_err(|e| {
                 // The shapes a failure happened on, once: a status 13 in the serving loop and not in
                 // the bench is a fact about this call, not about cublas.
-                if std::env::var("DF_DEBUG").is_ok() {
-                    // Is the refusal cublas's, or a poisoned context? An async fault from an earlier
-                    // kernel surfaces exactly like this: the call that reports it is not the call
-                    // that caused it.
-                    let sync = unsafe { cudaDeviceSynchronize() };
-                    eprintln!("dflash gemm failed: m={} n={} k={} ld={} x={:p} w={:p} y={:p} device-sync={}",
-                              self.rows, n, kk, kk, x.raw(), w.raw(), y.raw(), sync);
-                }
                 e.into()
             })
-            .inspect(|_| {
-                if std::env::var("DF_DEBUG").as_deref() == Ok("2") {
-                    eprintln!("dflash gemm ok: n={n} k={kk}");
-                }
-            })
+
     }
 
     /// `base_kernel` is [which][tap][D]; the kernel's `which = 1` wants the second `2 * D` block.

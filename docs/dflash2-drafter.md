@@ -139,3 +139,27 @@ Two things this engine has to decide, that TensorFold does not:
 `mlp_conv.{base_kernel}` 2x2x4096 and `{kernel_projection}` 1024x4096. **No `lm_head` and no
 `embed_tokens`**: the drafter scores through the target's head and reads the anchor's embedding from
 the target.
+
+## Where it plugs in, exactly
+
+The serving path is `tidelm-engine::forward` (the server is on `tidelm_engine`), not
+`tidelm-glm`'s Engine; that crate's layer loop is the one to hook. The pieces are done and
+compiled -- `dflash.rs` (weights), `dflash_fwd.rs` (`Run`, `Block`), `dflash.cu` (16 launchers) --
+so the wiring is the remaining work, and it is three edits plus one module:
+
+1. **Taps.** In the layer loop, after layer `l`'s residual write, when the drafter is on and
+   `l` is one of `[5, 14, 24, 33, 42]`: `run.tap(st, residual4, slot)`. `residual4` is the
+   mHC path's `[rows][4][D]` buffer -- the same one `df_tap` averages, so no repacking.
+2. **A round.** `tap x5 -> embed_taps -> pass -> the target's head over the 8 rows into the
+   engine's fp32 logits -> candidates -> anchor -> walk -> drafts`. The head stays the
+   target's: the checkpoint has no `lm_head`, and scoring the block through the drafter's
+   own head would be a different distribution than the one it was trained against.
+3. **The driver.** Mirror `Dspark` in the same file (`dspark: Option<Dspark>`, `dspark_seed`,
+   `dspark_draft`, `opts.spec`): a `Dflash` variant with `seed` (the prompt's last `WIN`
+   tokens through `ctx_kv` at each layer, into the ring) and `draft` (one round, `BLOCK - 1`
+   ids), handed to the existing block verify (`tidelm_core::spec::verify_sparse`), which is
+   already lossless for greedy. `GLM_DRAFTER=dflash2` selects it; unset keeps today's path.
+
+The first test is not acceptance, it is identity: drafter on and off must emit the same greedy
+tokens on 24 prompts. Acceptance (TensorFold measures ~5,6 tokens a pass) comes after, and only
+then the throughput comparison, which today is still not drafter-neutral.

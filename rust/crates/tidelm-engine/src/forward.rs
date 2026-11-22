@@ -2086,7 +2086,7 @@ impl Engine {
             let dir = std::env::var_os("GLM_DRAFTER_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| model_dir.join("../glm53-dflash2"));
-            let df = Dflash::open(&dir, &engine.stream, tidelm_dflash::BLOCK)?;
+            let df = Dflash::open(&dir, &engine.stream, tidelm_dflash::BLOCK * max_lanes)?;
             engine.dflash = Some(df);
         }
         Ok(engine)
@@ -4139,7 +4139,34 @@ impl Engine {
     /// Resident with graphs, the whole draft is one CUDA graph per number of lanes, with a
     /// single read-back.
     pub fn draft_batch(&mut self, reqs: &[(usize, u32, usize)]) -> Result<Vec<Vec<u32>>> {
+        if self.dflash.is_some() {
+            return self.dflash_draft(reqs);
+        }
         Ok(self.draft_inner(reqs, None)?.into_iter().map(|d| d.0).collect())
+    }
+
+    /// DFlash2's draft: the taps the last 8-row step captured, one block pass, the target's own
+    /// head over those 8 rows (already in `act.logits`), the selector's walk.
+    ///
+    /// One lane today: `Block` is opened for `BLOCK * max_lanes` rows but only lane 0's eight are
+    /// tapped, and a second stream's rows would be the previous step's. Said out loud rather than
+    /// left to look like support for something it does not do.
+    fn dflash_draft(&mut self, reqs: &[(usize, u32, usize)]) -> Result<Vec<Vec<u32>>> {
+        if reqs.len() != 1 {
+            return Err(format!("dflash draft: one lane at a time, got {}", reqs.len()).into());
+        }
+        let anchors: Vec<i32> = reqs.iter().map(|&(_, tok, _)| tok as i32).collect();
+        let (st, logits) = (&self.stream, self.act.logits.raw());
+        let df = self.dflash.as_ref().expect("checked above");
+        let picks = df.blk.round_bf16(st, &df.blas, &df.dr, logits, &anchors).map_err(|e| format!("dflash: {e}"))?;
+        // picks is [step][stream], step-major
+        let mut out = vec![Vec::with_capacity(tidelm_dflash::BLOCK - 1); reqs.len()];
+        for step in 0..(tidelm_dflash::BLOCK - 1) {
+            for lane in 0..reqs.len() {
+                out[lane].push(picks[step * reqs.len() + lane] as u32);
+            }
+        }
+        Ok(out)
     }
 
     /// `draft_batch` with sampled drafts (fastdecode.py's DRAFT_NUCLEUS draft): per lane

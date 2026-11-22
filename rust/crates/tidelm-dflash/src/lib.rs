@@ -482,6 +482,51 @@ impl Block {
         })
     }
 
+    /// The candidate list from **bf16** logits, which is what the engine's head leaves in
+    /// `act.logits` (`glm_argmax_bf16` reads the same buffer). Same chunked top-16, same layout.
+    pub fn candidates_bf16(&self, st: &Stream, logits: *const c_void) -> Result<()> {
+        ck(unsafe {
+            k::glm_df_launch_top16_part(st.raw(), logits, self.run.rows as i32, VOCAB as i32, 0, np(&self.pv), np(&self.pi))
+        }, "top16 part bf16")?;
+        ck(unsafe {
+            k::glm_df_launch_top16_merge(st.raw(), np(&self.pv), np(&self.pi), self.run.rows as i32, self.chunks as i32,
+                                         np(&self.cand))
+        }, "top16 merge")
+    }
+
+    /// `round` over bf16 logits (the engine's own buffer).
+    pub fn round_bf16(&self, st: &Stream, blas: &Blas, dr: &Drafter, logits: *const c_void, anchors: &[i32])
+                      -> Result<Vec<i32>> {
+        if anchors.len() != self.streams {
+            return Err(format!("round: {} anchors for {} streams", anchors.len(), self.streams).into());
+        }
+        self.run.embed_taps(st, blas, dr)?;
+        self.run.pass(st, blas, dr)?;
+        self.candidates_bf16(st, logits)?;
+        self.anchor(st, anchors)?;
+        self.walk(st, dr)?;
+        self.drafts(st)
+    }
+
+    /// One round, from taps already in `run.cin` to the drafts the walk chose:
+    /// `embed_taps -> pass -> top-16 over the target's logits -> the walk`.
+    ///
+    /// `logits` is the *target's* head over the same 8 rows, `[rows][VOCAB]` fp32 -- the checkpoint
+    /// has no `lm_head`, and scoring the block through anything else would be a distribution the
+    /// drafter never saw. `anchors` is one token a stream, the last the target accepted.
+    pub fn round(&self, st: &Stream, blas: &Blas, dr: &Drafter, logits: *const c_void, anchors: &[i32])
+                 -> Result<Vec<i32>> {
+        if anchors.len() != self.streams {
+            return Err(format!("round: {} anchors for {} streams", anchors.len(), self.streams).into());
+        }
+        self.run.embed_taps(st, blas, dr)?;
+        self.run.pass(st, blas, dr)?;
+        self.candidates(st, logits)?;
+        self.anchor(st, anchors)?;
+        self.walk(st, dr)?;
+        self.drafts(st)
+    }
+
     /// The candidate list of every row from the target's fp32 logits `[rows][VOCAB]`.
     pub fn candidates(&self, st: &Stream, logits: *const c_void) -> Result<()> {
         ck(unsafe {

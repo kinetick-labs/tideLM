@@ -163,3 +163,26 @@ so the wiring is the remaining work, and it is three edits plus one module:
 The first test is not acceptance, it is identity: drafter on and off must emit the same greedy
 tokens on 24 prompts. Acceptance (TensorFold measures ~5,6 tokens a pass) comes after, and only
 then the throughput comparison, which today is still not drafter-neutral.
+
+## The tap is *after* the layer, and the engine's existing hook is *before*
+
+`zig/src/families/glm/cuda_taps.zig` settles it, and it is the kind of detail that fails
+silently:
+
+    //! DFlash2's taps on the target's forward: after each tapped layer, its rows' 4-stream mean.
+    pub const layers = [_]usize{ 5, 14, 24, 33, 42 };
+    /// After layer `j` ... rows lo..lo+n of residual `x` (bf16 [rows][4][hidden]).
+
+TensorFold's `Taps.at(j, x, lo, n)` runs after layer `j`'s residual is written. The engine has a
+near-identical hook for DSpark, at `forward.rs:3863`, and it runs **before** `self.block(l)` --
+"the DSpark main hidden reads the attention INPUT of its target layers", i.e. the residual after
+layer `l - 1`.
+
+So `dspark_target_layer_ids` cannot be reused for DFlash2 even though it is the same measurement
+into the same shape: pointing it at `[5, 14, 24, 33, 42]` would feed the drafter the residuals of
+layers 4, 13, 23, 32 and 41. Nothing would error. The acceptance rate would simply come out worse
+than it should, and the obvious explanation would be the obvious wrong one.
+
+The drafter therefore gets its own hook after `self.block(...)`, its own buffer, and the same
+`df_tap` mode 0 (the 4 streams' mean) -- which is the same buffer layout `main_h` already has
+(`[rows][5][D]`), so `ds_gather_rows_u16` gathers the block's 8 rows at draft time unchanged.

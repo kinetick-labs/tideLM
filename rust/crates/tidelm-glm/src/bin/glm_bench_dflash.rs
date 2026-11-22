@@ -35,6 +35,7 @@ fn main() -> Result<()> {
     };
     let rows: usize = arg("--rows").and_then(|v| v.parse().ok()).unwrap_or(BLOCK);
     let iters: usize = arg("--iters").and_then(|v| v.parse().ok()).unwrap_or(20);
+    let nlayers: usize = arg("--layers").and_then(|v| v.parse().ok()).unwrap_or(LAYERS);
     if rows == 0 || rows % BLOCK != 0 {
         return Err(format!("--rows must be a multiple of {BLOCK}").into());
     }
@@ -66,6 +67,11 @@ fn main() -> Result<()> {
     let taps: Vec<u16> = (0..rows * 5 * k::D).map(|_| rnd()).collect();
     let cin = DeviceBuffer::from_slice(&taps)?;
     run.cin.copy_from(0, &cin, 0, taps.len(), &st)?;
+    // What the device actually holds: if this differs pass to pass, the input path is the suspect.
+    st.synchronize()?;
+    let back = run.cin.download()?;
+    let hsh = back.iter().fold(0u64, |h, &x| h.wrapping_mul(1099511628211).wrapping_add(x as u64));
+    println!("cin on device: {} values, hash {hsh:016x}, first {:?}", back.len(), &back[..4]);
     // One stream, starting at position 0 with no context: the attention sees the block's own keys.
     let starts = vec![0i64; run.streams];
     let froms = vec![0i64; run.streams];
@@ -97,6 +103,20 @@ fn main() -> Result<()> {
     };
     println!("embed (fc + hidden_norm): {:.3} ms", med(&mut embed));
     println!("five layers + norm + selector projection: {:.3} ms", med(&mut layers));
+
+    // Same process, same buffers, three passes: agreement here and disagreement across runs would
+    // mean the allocation is the variable (uninitialised memory); disagreement here is a race.
+    for i in 0..3 {
+        run.embed_taps(&blas, &dr)?;
+        run.pass_n(&st, &blas, &dr, nlayers)?;
+        st.synchronize()?;
+        let v = run.hn.download()?;
+        let mut x = v.clone();
+        let f = |b: u16| f32::from_bits((b as u32) << 16);
+        x.sort_by(|a, b| f(*a).partial_cmp(&f(*b)).unwrap());
+        println!("pass {}: min {:.4} max {:.4} sum {:.3} first {:?}", i, f(x[0]), f(x[x.len() - 1]),
+                 v.iter().map(|&b| f(b) as f64).sum::<f64>(), v[..4].iter().map(|&b| f(b)).collect::<Vec<f32>>());
+    }
 
     let hn = run.hn.download()?;
     let g = run.g.download()?;

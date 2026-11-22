@@ -210,3 +210,21 @@ one of the six launches a layer. The candidates, in the order I would eliminate 
 This has to be settled before any acceptance number: a drafter that scores a different block each
 run cannot be reasoned about, and the acceptance rate would look plausibly bad for a reason that
 is not the design.
+
+### What the bisection says
+
+`glm_bench_dflash --layers N` runs the first N layers, three passes in one process:
+
+- **N = 0** (fc + hidden_norm + final norm + selector projection, no layer at all): pass 0 differs,
+  passes 1 and 2 agree exactly. `hn[0..4]` = [0.016, 0.041, 0.020, 0.087] against
+  [0.81, -0.77, -3.38, 0.67]. The input is not the variable -- `cin` read back from the device has
+  the same 163840 values and the same hash every pass.
+- **N >= 1**: every pass differs, including two passes run back to back.
+
+So there are two faults, not one. The first is a cold-start read (the first execution after the
+warm-up sees something the later ones do not, with no layer involved, which puts it in `embed_taps`
+or the final norm). The second is per-call drift as soon as a layer runs, which is what makes the
+acceptance measurement meaningless until it is fixed.
+
+Neither is a numerical-noise story: a bf16 rounding difference cannot turn a sum of 32768 hiddens
+from +30 to -85, and cannot move `hn[0]` from 0.016 to 0.81.

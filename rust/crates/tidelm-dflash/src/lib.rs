@@ -329,13 +329,19 @@ impl Run {
         Ok(())
     }
 
-    /// The five layers over `rows` (the taps already in `x` by `fc`), then `norm` and the
-    /// selector's projection. Returns nothing: `hn` and `g` are the outputs.
+    /// The five layers over `rows` (the taps already in `cin`), then `norm` and the selector's
+    /// projection. Returns nothing: `hn` and `g` are the outputs.
     pub fn pass(&self, st: &Stream, blas: &Blas, dr: &Drafter) -> Result<()> {
+        self.pass_n(st, blas, dr, LAYERS)
+    }
+
+    /// `pass` over the first `n` layers only: the bisection `pass`'s determinism needs, and the
+    /// only way to say which layer first reads something nobody wrote.
+    pub fn pass_n(&self, st: &Stream, blas: &Blas, dr: &Drafter, n: usize) -> Result<()> {
         let sr = st.raw();
         let (m, d) = (self.rows, k::D);
         unsafe {
-            for (li, l) in dr.layers.iter().enumerate() {
+            for (li, l) in dr.layers.iter().enumerate().take(n) {
                 // y = rmsnorm(x, in_norm); dyn = a_proj(y); y2 = conv(y, which 0)
                 glm::glm_rmsnorm(sr, np(&self.x), d as i64, std::ptr::null(), 0, np(&l.in_norm), np(&self.y), d as i64,
                                  m as i32, d as i32, EPS);

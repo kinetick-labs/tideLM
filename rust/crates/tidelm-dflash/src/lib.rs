@@ -435,7 +435,15 @@ impl Run {
             y: &DeviceBuffer<u16>) -> Result<()> {
         blas.gemm_rm(self.rows, n, kk, Mat { ptr: x.raw(), ty: R_16BF, ld: kk as i64 },
                      Mat { ptr: w.raw(), ty: R_16BF, ld: kk as i64 }, true, y.raw(), R_16BF, n as i64)
-            .map_err(|e| e.into())
+            .map_err(|e| {
+                // The shapes a failure happened on, once: a status 13 in the serving loop and not in
+                // the bench is a fact about this call, not about cublas.
+                if std::env::var("DF_DEBUG").is_ok() {
+                    eprintln!("dflash gemm failed: m={} n={} k={} ld={} x={:p} w={:p} y={:p}",
+                              self.rows, n, kk, kk, x.raw(), w.raw(), y.raw());
+                }
+                e.into()
+            })
     }
 
     /// `base_kernel` is [which][tap][D]; the kernel's `which = 1` wants the second `2 * D` block.

@@ -316,6 +316,11 @@ pub struct MtpRows<'a> {
 pub struct Dflash {
     pub dr: tidelm_dflash::Drafter,
     pub blk: tidelm_dflash::Block,
+    /// The drafter's own stream and GEMM handle. The engine's, reused, failed on the round's last
+    /// projection (m=8 n=256 k=4096, cublas status 13) after every GEMM before it had succeeded --
+    /// an interaction with the engine's handle state, not with the shapes.
+    pub own: Stream,
+    pub blas: Blas,
 }
 
 impl Dflash {
@@ -325,7 +330,9 @@ impl Dflash {
         let ck = tidelm_model::Checkpoint::open(dir)?;
         let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
         let blk = tidelm_dflash::Block::new(&dr, rows).map_err(|e| format!("dflash: {e}"))?;
-        Ok(Dflash { dr, blk })
+        let own = Stream::new()?;
+        let blas = Blas::new(own.raw()).map_err(|e| format!("dflash: {e}"))?;
+        Ok(Dflash { dr, blk, own, blas })
     }
 }
 
@@ -835,10 +842,15 @@ impl Engine {
             Some(d) => d,
             None => return Ok(Vec::new()),
         };
-        df.blk.run.set_tables(&self.st, starts, froms, bpos).map_err(|e| format!("dflash tables: {e}"))?;
-        df.blk.seed_taps(&self.st, &self.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
-        let picks = df.blk.round_bf16(&self.st, &self.blas, &df.dr, np(&self.act.logits), anchors)
+        // The engine's loop is serial here: join it, run the round on the drafter's own stream, and
+        // join back. Two syncs a round buy isolation from the engine's cublas handle state, which is
+        // what the status 13 was.
+        self.st.synchronize()?;
+        df.blk.run.set_tables(&df.own, starts, froms, bpos).map_err(|e| format!("dflash tables: {e}"))?;
+        df.blk.seed_taps(&df.own, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
+        let picks = df.blk.round_bf16(&df.own, &df.blas, &df.dr, np(&self.act.logits), anchors)
             .map_err(|e| format!("dflash round: {e}"))?;
+        df.own.synchronize()?;
         Ok(picks)
     }
 

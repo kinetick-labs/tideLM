@@ -547,6 +547,17 @@ fn ck(rc: i32, what: &str) -> Result<()> {
 }
 
 
+
+/// The target layers DFlash2 reads, in tap-slot order (the checkpoint's `target_layer_ids`).
+/// They are captured **after** the layer's residual is written, which is not where this engine's
+/// DSpark hook reads: see docs/dflash2-drafter.md, "The tap is after the layer".
+pub const TAP_LAYERS: [usize; 5] = [5, 14, 24, 33, 42];
+
+/// Layer `l`'s tap slot, or None for a layer DFlash2 does not read.
+pub fn tap_slot(l: usize) -> Option<usize> {
+    TAP_LAYERS.iter().position(|&x| x == l)
+}
+
 /// A bf16 tensor from the checkpoint to the device. The drafter ships bf16 throughout, so a
 /// tensor of another dtype is an error rather than something to widen: a silently cast weight is
 /// how a drafter ends up scoring the wrong distribution.

@@ -1248,6 +1248,25 @@ struct Resident {
     ids: DeviceBuffer<i32>,
 }
 
+/// The DFlash2 drafter as the serving loop holds it: weights, one block's buffers, one GEMM
+/// handle. Everything about it is per-model, not per-request.
+pub struct Dflash {
+    dr: tidelm_dflash::Drafter,
+    blk: tidelm_dflash::Block,
+    blas: tidelm_kernels::blas::Blas,
+}
+
+impl Dflash {
+    /// Open the drafter's own checkpoint and wire its block. Called once, after the model loads.
+    pub fn open(dir: &std::path::Path, stream: &Stream, rows: usize) -> Result<Self> {
+        let ck = Checkpoint::open(dir)?;
+        let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
+        let blk = tidelm_dflash::Block::new(&dr, rows).map_err(|e| format!("dflash: {e}"))?;
+        let blas = tidelm_kernels::blas::Blas::new(stream.raw()).map_err(|e| format!("dflash: {e}"))?;
+        Ok(Dflash { dr, blk, blas })
+    }
+}
+
 struct Dspark {
     blocks: Vec<Layer>,
     w: DsparkW,
@@ -1309,6 +1328,9 @@ pub struct Engine {
     /// steps run so far (Lane::step)
     step_no: u64,
     dspark: Option<Dspark>,
+    /// GLM_DRAFTER=dflash2: the DFlash2 drafter, its block buffers, and the GEMM handle they use.
+    /// Its taps come from `df_tap` after layers 5/14/24/33/42, not from `main_h`.
+    dflash: Option<Dflash>,
     resident: Option<Resident>,
     /// [layer][expert] routable mask (u8) for the router, both modes; None = all
     keep: Option<DeviceBuffer<u8>>,
@@ -1964,7 +1986,7 @@ impl Engine {
             ds_set_pdl(pdl as i32);
             fp4::fp4_moe_cuda_set_pdl(pdl as i32);
         }
-        Ok(Engine {
+        let mut engine = Engine {
             arena: Arena::new(ARENA_SLOTS + 1, None)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
             logits_host: PinnedBuffer::zeroed(tm * cfg.vocab_size)?,
@@ -1989,6 +2011,7 @@ impl Engine {
             max_lanes,
             step_no: 0,
             dspark,
+            dflash: None,
             resident,
             keep,
             demand,
@@ -2055,7 +2078,18 @@ impl Engine {
             pf_fork: Event::new()?,
             pf_join: Event::new()?,
             pf_open: std::cell::Cell::new(false),
-        })
+        };
+        engine.stream.synchronize()?;
+        // GLM_DRAFTER=dflash2: the drafter's own checkpoint, attached once. Everything it needs to
+        // draft comes from the taps the layer loop captures at 5/14/24/33/42.
+        if std::env::var("GLM_DRAFTER").as_deref() == Ok("dflash2") {
+            let dir = std::env::var_os("GLM_DRAFTER_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| model_dir.join("../glm53-dflash2"));
+            let df = Dflash::open(&dir, &engine.stream, tidelm_dflash::BLOCK)?;
+            engine.dflash = Some(df);
+        }
+        Ok(engine)
     }
 
     /// Join a pair before the first step (its MoE combines all-reduce over `pair.comm`).
@@ -3878,6 +3912,13 @@ impl Engine {
                 }
             }
             res?;
+            // DFlash2's taps: after layer `l`'s residual, its rows' 4-stream mean. The 8-row
+            // verify step is the only one a draft reads.
+            if t == tidelm_dflash::BLOCK {
+                if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
+                    df.blk.run.tap(&self.stream, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;
+                }
+            }
             self.times.compute_s += tc.elapsed().as_secs_f64();
             if let (Some(dir), false) = (&self.dump_dir, capturing) {
                 let mut hb = vec![0u16; self.live_rows * hc * d];

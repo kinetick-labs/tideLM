@@ -1833,6 +1833,14 @@ impl Engine {
                     }
                 }
             }
+            // The window capture: a prefill chunk is the only pass with WIN rows of residuals, and
+            // those rows are what the seed needs to speak for the prompt instead of for eight keys.
+            if t > 2 * VERIFY_ROWS {
+                if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
+                    df.blk.run.tap_window(&self.st, np(&self.act.h), np(&self.act.pos), slot, t, 0)
+                        .map_err(|e| format!("dflash window tap: {e}"))?;
+                }
+            }
             // A verify pass carries one block per lane, packed back to back (`row0 += 1 + nd` in
             // serve.rs), so its width is the sum over lanes -- 15 for two blocks of eight and seven,
             // which is why `t == VERIFY_ROWS` was true twice a request and never on the round that

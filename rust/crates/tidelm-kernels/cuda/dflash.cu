@@ -400,6 +400,30 @@ extern "C" int glm_df_launch_tap(cudaStream_t st, const void* x, void* out, int 
     return df_check();
 }
 
+// The window capture: the same mean of four streams as glm_df_tap, but written at the row's own
+// position in a [WIN][5][D] ring instead of at its index in the pass. The prefill is the only place
+// the last WIN rows of a sequence exist as residuals, and the drafter's seed needs exactly those.
+extern "C" __global__ void glm_df_tap_ring(const __nv_bfloat16* __restrict__ x, const int* __restrict__ pos,
+                                           __nv_bfloat16* __restrict__ out, int slot, int rows, int base, int win) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const int p = pos[base + r];
+    if (p < 0) return;
+    const __nv_bfloat16* xr = x + (long long)r * 4 * D;
+    __nv_bfloat16* o = out + ((long long)(p % win) * 5 + slot) * D;
+    for (int d = blockIdx.y * 1024 + threadIdx.x; d < (blockIdx.y + 1) * 1024; d += blockDim.x) {
+        const float a = ((bf(xr[d]) + bf(xr[D + d])) + bf(xr[2 * D + d])) + bf(xr[3 * D + d]);
+        o[d] = tobf(a / 4.0f);
+    }
+}
+
+extern "C" int glm_df_launch_tap_ring(cudaStream_t st, const void* x, const void* pos, void* out,
+                                      int rows, int base, int slot, int win) {
+    glm_df_tap_ring<<<dim3(rows, D / 1024), 256, 0, st>>>((const __nv_bfloat16*)x, (const int*)pos,
+                                                         (__nv_bfloat16*)out, slot, rows, base, win);
+    return df_check();
+}
+
 extern "C" int glm_df_launch_block_qkv(cudaStream_t st, const void* qkv, int ldq, const void* qn, const void* kn,
                                        const void* pos, int rows, float eps, float theta, void* q, void* kb, void* vb) {
     glm_df_block_qkv<<<dim3(rows, QH + KVH), 64, 0, st>>>((const __nv_bfloat16*)qkv, ldq, (const __nv_bfloat16*)qn,

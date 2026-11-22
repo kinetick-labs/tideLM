@@ -245,6 +245,12 @@ pub struct Run {
     pub starts: DeviceBuffer<i64>,
     pub froms: DeviceBuffer<i64>,
     pub bpos: DeviceBuffer<i32>,
+    /// The residuals of the last WIN rows of the sequence at the five tapped layers, `[WIN][5][D]`:
+    /// 84 MB. The seed reads this instead of the block's eight rows; without it the drafter sees
+    /// eight keys of context and accepts what eight keys can justify (0,64 a round measured).
+    pub win: DeviceBuffer<u16>,
+    /// Rows the capture has written, so the seed knows how much of the ring is real.
+    pub win_rows: std::sync::atomic::AtomicUsize,
     /// Where `ctx_kv` writes the short seed: BLOCK positions before the anchor.
     pub bseed: DeviceBuffer<i32>,
     pub rows: usize,
@@ -282,6 +288,8 @@ impl Run {
             froms: DeviceBuffer::zeroed(streams)?,
             bpos: DeviceBuffer::zeroed(m)?,
             bseed: DeviceBuffer::zeroed(BLOCK)?,
+            win: DeviceBuffer::zeroed(WIN * 5 * k::D)?,
+            win_rows: std::sync::atomic::AtomicUsize::new(0),
             rows,
             streams,
             ring_row: dr.ring_row,
@@ -324,6 +332,16 @@ impl Run {
     /// slot `slot`: the mean of the streams, which is the layout `fc` reads.
     pub fn tap(&self, st: &Stream, x: *const c_void, slot: usize) -> Result<()> {
         ck(unsafe { k::glm_df_launch_tap(st.raw(), x, np(&self.cin), self.rows as i32, slot as i32, 0) }, "tap")
+    }
+
+    /// The same tap, into the window ring, at each row's own position (`pos[base + r]`). Only the
+    /// prefill has WIN rows of residuals at once; a verify pass has eight.
+    pub fn tap_window(&self, st: &Stream, x: *const c_void, pos: *const c_void, slot: usize, rows: usize, base: usize) -> Result<()> {
+        ck(unsafe {
+            k::glm_df_launch_tap_ring(st.raw(), x, pos, np(&self.win), rows as i32, base as i32, slot as i32, WIN as i32)
+        }, "tap ring")?;
+        self.win_rows.fetch_max(base + rows, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// `x = rmsnorm(fc(cin), hidden_norm)`: the five taps into the drafter's width.

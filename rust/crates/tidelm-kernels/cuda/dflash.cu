@@ -541,6 +541,21 @@ extern "C" __global__ void __launch_bounds__(256) glm_df_select(const __nv_bfloa
     }
 }
 
+// The target's head leaves f32 logits (tidalm-glm's act.head, [HEAD_ROWS][vl]); the block's
+// scoring kernel reads bf16. One cast, rows x vocab, 2.4 MB at rows 8 and vocab 154880.
+extern "C" __global__ void glm_df_cast_bf16_k(const float* __restrict__ src, __nv_bfloat16* __restrict__ dst, long long n) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+        dst[i] = (__nv_bfloat16)src[i];
+}
+
+extern "C" int glm_df_launch_cast_bf16(cudaStream_t st, const void* src, void* dst, long long n) {
+    const int thread = 256;
+    int blocks = (int)((n + thread - 1) / thread);
+    if (blocks > 4096) blocks = 4096;
+    glm_df_cast_bf16_k<<<blocks, thread, 0, st>>>((const float*)src, (__nv_bfloat16*)dst, n);
+    return df_check();
+}
+
 extern "C" int glm_df_launch_select(cudaStream_t st, const void* pred, const void* succ, const void* g, const void* cand,
                                     const void* prev, const void* rsel, void* out, int streams, int rank) {
     glm_df_select<<<dim3(streams), 256, 0, st>>>((const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,

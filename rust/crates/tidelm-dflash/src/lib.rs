@@ -532,10 +532,13 @@ impl Block {
 
     /// The candidate list from **bf16** logits, which is what the engine's head leaves in
     /// `act.logits` (`glm_argmax_bf16` reads the same buffer). Same chunked top-16, same layout.
+    /// The target's head logits ([rows][vocab], f32 -- tidelm-glm's `act.head`) into the block's
+    /// candidates. The f32 variant of the kernel already existed: no cast, no copy.
     pub fn candidates_bf16(&self, st: &Stream, logits: *const c_void, vocab: usize) -> Result<()> {
         ck(unsafe {
-            k::glm_df_launch_top16_part(st.raw(), logits, self.run.rows as i32, vocab as i32, 0, np(&self.pv), np(&self.pi))
-        }, "top16 part bf16")?;
+            k::glm_df_launch_top16_part_f32(st.raw(), logits, self.run.rows as i32, vocab as i32, 0,
+                                            np(&self.pv), np(&self.pi))
+        }, "top16 part f32")?;
         ck(unsafe {
             k::glm_df_launch_top16_merge(st.raw(), np(&self.pv), np(&self.pi), self.run.rows as i32, self.chunks as i32,
                                          np(&self.cand))

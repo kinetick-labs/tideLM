@@ -850,7 +850,7 @@ impl Engine {
         df.blk.seed_taps(&df.own, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
         // The target's head is `vl` wide (147,456 at world 1), not the drafter checkpoint's
         // VOCAB: scoring the block over the wrong stride read 68 KB past the logits buffer.
-        let picks = df.blk.round_bf16(&df.own, &df.blas, &df.dr, np(&self.act.logits), anchors, self.vl)
+        let picks = df.blk.round_bf16(&df.own, &df.blas, &df.dr, np(&self.act.head), anchors, self.vl)
             .map_err(|e| format!("dflash round: {e}"))?;
         df.own.synchronize()?;
         Ok(picks)

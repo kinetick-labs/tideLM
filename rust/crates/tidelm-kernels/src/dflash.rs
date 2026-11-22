@@ -50,6 +50,15 @@ extern "C" {
                                      chunks: c_int, out: *mut c_void) -> c_int;
     pub fn glm_df_launch_gsum(stream: CudaStream, x: *const c_void, ldx: c_int, rows: c_int, k: c_int,
                               xs: *mut c_void) -> c_int;
+    /// The same chunked top-16 over an fp32 logits row (the target's head is fp32).
+    pub fn glm_df_launch_top16_part_f32(stream: CudaStream, logits: *const c_void, rows: c_int, cols: c_int,
+                                        offset: c_int, pv: *mut c_void, pi: *mut c_void) -> c_int;
+    /// One step of the selector's walk: `streams` active rows (`rsel[i]` is the row `i` reads its
+    /// candidates from), `prev[i]` the chain's last id, `out[i]` the pick. One launch a step
+    /// because the next step's predecessor is this step's pick.
+    pub fn glm_df_launch_select(stream: CudaStream, pred: *const c_void, succ: *const c_void, g: *const c_void,
+                                cand: *const c_void, prev: *const c_void, rsel: *const c_void, out: *mut c_void,
+                                streams: c_int, rank: c_int) -> c_int;
 }
 
 /// The drafter's fixed sizes, from the checkpoint's `config.json`. Anything that reads them from a

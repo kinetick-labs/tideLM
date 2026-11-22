@@ -474,3 +474,74 @@ extern "C" int glm_df_launch_gsum(cudaStream_t st, const void* x, int ldx, int r
     glm_df_gsum<<<dim3(rows), 128, 0, st>>>((const __nv_bfloat16*)x, ldx, k, (float*)xs);
     return df_check();
 }
+
+// The same chunked top-16 over an fp32 logits row: the target's head is fp32 here (the drafter's
+// block is scored by the target, which is where the logits already land).
+extern "C" __global__ void __launch_bounds__(256) glm_df_top16_part_f32(const float* __restrict__ logits, int cols,
+                                                                       int offset, float* __restrict__ pv,
+                                                                       int* __restrict__ pi) {
+    __shared__ float sv[CHUNK_COLS];
+    __shared__ int si[CHUNK_COLS];
+    __shared__ float rv[8];
+    __shared__ int ri[16];
+    const int r = blockIdx.x, c0 = blockIdx.y * CHUNK_COLS;
+    const int n = min(CHUNK_COLS, cols - c0);
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        sv[j] = logits[(long long)r * cols + c0 + j];
+        si[j] = offset + c0 + j;
+    }
+    __syncthreads();
+    const long long base = ((long long)r * gridDim.y + blockIdx.y) * TOP;
+    for (int t = 0; t < TOP; ++t) takeBest(sv, si, n, rv, ri, pv + base + t, pi + base + t);
+}
+
+extern "C" int glm_df_launch_top16_part_f32(cudaStream_t st, const void* logits, int rows, int cols, int offset, void* pv,
+                                            void* pi) {
+    glm_df_top16_part_f32<<<dim3(rows, (cols + CHUNK_COLS - 1) / CHUNK_COLS), 256, 0, st>>>(
+        (const float*)logits, cols, offset, (float*)pv, (int*)pi);
+    return df_check();
+}
+
+// The candidate selector, one block a stream. The chain is sequential -- the next step's
+// predecessor is this step's pick -- so this is one launch a step, over the streams' current row.
+// pg = predecessor_codebook[prev] * g over the ranks; each candidate scores its successor row,
+// value + pg . succ[id], and the winner is the draft.
+extern "C" __global__ void __launch_bounds__(256) glm_df_select(const __nv_bfloat16* __restrict__ pred,
+                                                                const __nv_bfloat16* __restrict__ succ,
+                                                                const __nv_bfloat16* __restrict__ g,
+                                                                const int* __restrict__ cand,
+                                                                const int* __restrict__ prev,
+                                                                const int* __restrict__ rsel, int* __restrict__ out,
+                                                                int rank) {
+    __shared__ float pg[256];
+    __shared__ float sc[TOP];
+    const int s = blockIdx.x, r = rsel[s], p = prev[s];
+    const __nv_bfloat16* gr = g + (long long)r * rank;
+    const __nv_bfloat16* pr = pred + (long long)p * rank;
+    for (int c = threadIdx.x; c < rank; c += blockDim.x) pg[c] = bf(pr[c]) * bf(gr[c]);
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    for (int i = warp; i < TOP; i += nw) {
+        const int id = cand[r * 2 * TOP + i];
+        const __nv_bfloat16* sr = succ + (long long)id * rank;
+        float a = 0.f;
+        for (int c = lane; c < rank; c += 32) a += pg[c] * bf(sr[c]);
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(0xffffffffu, a, o);
+        if (lane == 0) sc[i] = a + __int_as_float(cand[r * 2 * TOP + TOP + i]);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int best = 0;
+        for (int i = 1; i < TOP; ++i)
+            if (sc[i] > sc[best]) best = i;
+        out[s] = cand[r * 2 * TOP + best];
+    }
+}
+
+extern "C" int glm_df_launch_select(cudaStream_t st, const void* pred, const void* succ, const void* g, const void* cand,
+                                    const void* prev, const void* rsel, void* out, int streams, int rank) {
+    glm_df_select<<<dim3(streams), 256, 0, st>>>((const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,
+                                                (const __nv_bfloat16*)g, (const int*)cand, (const int*)prev,
+                                                (const int*)rsel, (int*)out, rank);
+    return df_check();
+}

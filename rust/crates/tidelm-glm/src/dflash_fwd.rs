@@ -21,7 +21,7 @@ use tidelm_kernels::blas::{Blas, Mat, R_16BF};
 use tidelm_kernels::dflash as k;
 use tidelm_kernels::glm;
 
-use crate::dflash::{Drafter, BLOCK, FF, LAYERS, RANK};
+use crate::dflash::{Drafter, BLOCK, FF, RANK, VOCAB};
 use crate::Result;
 
 /// Q | K | V rows of one layer's fused projection (4096 + 1024 + 1024).
@@ -131,6 +131,12 @@ impl Run {
         Ok(())
     }
 
+    /// Capture at the layer whose residual is `x` (`[rows][4][D]`, the four streams) into tap
+    /// slot `slot`: the mean of the streams, which is the layout `fc` reads.
+    pub fn tap(&self, st: &Stream, x: *const c_void, slot: usize) -> Result<()> {
+        ck(unsafe { k::glm_df_launch_tap(st.raw(), x, np(&self.cin), self.rows as i32, slot as i32, 0) }, "tap")
+    }
+
     /// `x = rmsnorm(fc(cin), hidden_norm)`: the five taps into the drafter's width.
     pub fn embed_taps(&self, blas: &Blas, dr: &Drafter) -> Result<()> {
         self.gemm(blas, &self.cin, &dr.fc, k::D, 5 * k::D, &self.y2)?;
@@ -206,5 +212,111 @@ impl Run {
     /// `base_kernel` is [which][tap][D]; the kernel's `which = 1` wants the second `2 * D` block.
     fn base_at(&self, base: &DeviceBuffer<u16>, which: usize) -> *mut c_void {
         unsafe { (base.raw() as *mut u8).add(which * 2 * k::D * 2) as *mut c_void }
+    }
+}
+
+/// A block's tail: the candidates the target's head scores, and the selector's walk over them.
+///
+/// The head is the target's, so this struct never calls it: the engine writes the block's fp32
+/// logits and hands the pointer to `candidates`. The walk is `BLOCK - 1` launches because each
+/// step's predecessor is the previous step's pick; the chain lives on the device (`chain`) and only
+/// the drafts come back.
+pub struct Block {
+    pub run: Run,
+    pub pv: DeviceBuffer<f32>,
+    pub pi: DeviceBuffer<i32>,
+    /// `[rows][2][16]`: ids then the values as f32 bits, as `top16_merge` writes them.
+    pub cand: DeviceBuffer<i32>,
+    /// `[BLOCK][streams]`: the walk's ids, `chain[0]` the anchors.
+    pub chain: DeviceBuffer<i32>,
+    /// `[BLOCK - 1][streams]`: which row each step reads its candidates from.
+    pub rsel: DeviceBuffer<i32>,
+    pub chunks: usize,
+    pub streams: usize,
+}
+
+impl Block {
+    pub fn new(dr: &Drafter, rows: usize) -> Result<Self> {
+        let streams = rows / BLOCK;
+        let chunks = VOCAB.div_ceil(4096);
+        let mut rsel = Vec::with_capacity((BLOCK - 1) * streams);
+        for step in 1..BLOCK {
+            for s in 0..streams {
+                rsel.push((s * BLOCK + step) as i32);
+            }
+        }
+        Ok(Self {
+            run: Run::new(dr, rows)?,
+            pv: DeviceBuffer::zeroed(rows * chunks * 16)?,
+            pi: DeviceBuffer::zeroed(rows * chunks * 16)?,
+            cand: DeviceBuffer::zeroed(rows * 2 * 16)?,
+            chain: DeviceBuffer::zeroed(BLOCK * streams)?,
+            rsel: DeviceBuffer::from_slice(&rsel)?,
+            chunks,
+            streams,
+        })
+    }
+
+    /// The candidate list of every row from the target's fp32 logits `[rows][VOCAB]`.
+    pub fn candidates(&self, st: &Stream, logits: *const c_void) -> Result<()> {
+        ck(unsafe {
+            k::glm_df_launch_top16_part_f32(st.raw(), logits, self.run.rows as i32, VOCAB as i32, 0, np(&self.pv),
+                                            np(&self.pi))
+        }, "top16 part")?;
+        ck(unsafe {
+            k::glm_df_launch_top16_merge(st.raw(), np(&self.pv), np(&self.pi), self.run.rows as i32, self.chunks as i32,
+                                         np(&self.cand))
+        }, "top16 merge")
+    }
+
+    /// The anchors (`streams` ids) into `chain[0]`, then the walk. Leaves the drafts in `chain`.
+    pub fn walk(&self, st: &Stream, dr: &Drafter) -> Result<()> {
+        for step in 1..BLOCK {
+            ck(unsafe {
+                k::glm_df_launch_select(
+                   st.raw(),
+                   np(&dr.pred),
+                   np(&dr.succ),
+                   np(&self.run.g),
+                   np(&self.cand),
+                   at(&self.chain, (step - 1) * self.streams),
+                   at(&self.rsel, (step - 1) * self.streams),
+                   at(&self.chain, step * self.streams),
+                   self.streams as i32,
+                   RANK as i32,
+                )
+            }, "select")?;
+        }
+        Ok(())
+    }
+
+    /// The drafts the walk chose, `[BLOCK - 1][streams]` row-major: step 1 first.
+    pub fn drafts(&self, st: &Stream) -> Result<Vec<i32>> {
+        st.synchronize()?;
+        let mut v = self.chain.download()?;
+        v.drain(..self.streams);
+        Ok(v)
+    }
+
+    /// The anchors go in at the head of the chain.
+    pub fn anchor(&self, st: &Stream, ids: &[i32]) -> Result<()> {
+        let a = DeviceBuffer::from_slice(ids)?;
+        self.chain.copy_from(0, &a, 0, ids.len(), st)?;
+        Ok(())
+    }
+}
+
+/// `b`'s pointer `n` elements in.
+fn at<T: Copy>(b: &DeviceBuffer<T>, n: usize) -> *mut c_void {
+    let sz = std::mem::size_of::<T>();
+    unsafe { (b.raw() as *mut u8).add(n * sz) as *mut c_void }
+}
+
+/// A CUDA launcher's status: 0, or the last error the device reported.
+fn ck(rc: i32, what: &str) -> Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!("dflash {what}: cuda error {rc}").into())
     }
 }

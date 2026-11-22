@@ -245,6 +245,8 @@ pub struct Run {
     pub starts: DeviceBuffer<i64>,
     pub froms: DeviceBuffer<i64>,
     pub bpos: DeviceBuffer<i32>,
+    /// Where `ctx_kv` writes the short seed: BLOCK positions before the anchor.
+    pub bseed: DeviceBuffer<i32>,
     pub rows: usize,
     pub streams: usize,
     /// Ring elements a stream's window uses ([layers][2][WIN][KVW]).
@@ -279,6 +281,7 @@ impl Run {
             starts: DeviceBuffer::zeroed(streams)?,
             froms: DeviceBuffer::zeroed(streams)?,
             bpos: DeviceBuffer::zeroed(m)?,
+            bseed: DeviceBuffer::zeroed(BLOCK)?,
             rows,
             streams,
             ring_row: dr.ring_row,
@@ -287,16 +290,27 @@ impl Run {
 
     /// The tables a pass reads: per stream its position (the anchor's), the start of its context
     /// in the ring and how far back the window may look; and per row its position.
-    pub fn set_tables(&self, st: &Stream, starts: &[i64], froms: &[i64], bpos: &[i64]) -> Result<()> {
-        fn put<T: Copy>(buf: &DeviceBuffer<T>, st: &Stream, data: &[T]) -> Result<()> {
-            let tmp = DeviceBuffer::from_slice(data)?;
-            buf.copy_from(0, &tmp, 0, data.len(), st)?;
-            Ok(())
+    /// `bseed` is where the short seed writes its keys -- the BLOCK positions *before* the anchor,
+    /// which is the window attention actually reads (`[from, p0)`). Writing the seed at the rows'
+    /// own positions (p0..p0+7) put every key outside that window: the pass then read n_ctx zeroed
+    /// slots instead, and `exp(0 - m)` for two thousand of them drowned the eight real ones.
+    pub fn set_tables(&self, st: &Stream, starts: &[i64], froms: &[i64], bpos: &[i64], bseed: &[i64]) -> Result<()> {
+        fn put<T: Copy + 'static>(buf: &DeviceBuffer<T>, st: &Stream, data: &[T]) -> Result<()> {
+            // Straight into the table: `from_slice` + `copy_from` allocated and freed ~1 MiB a
+            // call, five times a round, and `cudaFree` synchronizes the device -- that, not the two
+            // stream joins, is where the round's 190 ms went against the bench's 9.4.
+            if data.len() != buf.len() {
+                return Err(format!("dflash tables: {} values for {} rows", data.len(), buf.len()).into());
+            }
+            buf.upload_async(0, data, st)
+                .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
         }
         put(&self.starts, st, starts)?;
         put(&self.froms, st, froms)?;
         let b: Vec<i32> = bpos.iter().map(|&p| p as i32).collect();
         put(&self.bpos, st, &b)?;
+        let sd: Vec<i32> = bseed.iter().map(|&p| p as i32).collect();
+        put(&self.bseed, st, &sd)?;
         // A ring per stream, contiguous: stream s owns ring.row elements.
         let mut r: Vec<u64> = Vec::with_capacity(self.streams);
         for s in 0..self.streams {
@@ -507,7 +521,7 @@ impl Block {
                          (2 * k::KVW) as i64)
                 .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
             ck(unsafe {
-                k::glm_df_launch_ctx_kv(st.raw(), np(&self.run.qkv), np(&l.kn), np(&self.run.bpos), np(&self.run.rings),
+                k::glm_df_launch_ctx_kv(st.raw(), np(&self.run.qkv), np(&l.kn), np(&self.run.bseed), np(&self.run.rings),
                                         li as i32, m as i32, EPS, THETA)
             }, "ctx_kv")?;
         }
@@ -523,8 +537,16 @@ impl Block {
             k::glm_df_launch_top16_part_f32(st.raw(), logits, self.run.rows as i32, vocab as i32, 0,
                                             np(&self.pv), np(&self.pi))
         }, "top16 part f32")?;
+        // The part kernel grids over the width it is given (vl, the target's head), while pv/pi are
+        // sized on the checkpoint's VOCAB: merging `self.chunks` here read 32 never-written slots
+        // per row -- value 0.0, id 0 -- and 0.0 beats every negative logit, so id 0 was a candidate
+        // on every row. Merge exactly as many chunks as were written.
+        let chunks = vocab.div_ceil(4096);
+        if vocab > VOCAB {
+            return Err(format!("dflash top16: {vocab} wide, the codebooks hold {VOCAB}").into());
+        }
         ck(unsafe {
-            k::glm_df_launch_top16_merge(st.raw(), np(&self.pv), np(&self.pi), self.run.rows as i32, self.chunks as i32,
+            k::glm_df_launch_top16_merge(st.raw(), np(&self.pv), np(&self.pi), self.run.rows as i32, chunks as i32,
                                          np(&self.cand))
         }, "top16 merge")
     }
@@ -605,9 +627,8 @@ impl Block {
 
     /// The anchors go in at the head of the chain.
     pub fn anchor(&self, st: &Stream, ids: &[i32]) -> Result<()> {
-        let a = DeviceBuffer::from_slice(ids)?;
-        self.chain.copy_from(0, &a, 0, ids.len(), st)?;
-        Ok(())
+        self.chain.upload_async(0, ids, st)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
     }
 }
 

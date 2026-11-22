@@ -1214,10 +1214,19 @@ impl Server {
                     continue;
                 }
                 let p0 = blocks[k].p as i64 + 1;
-                let from = (p0 - (tidelm_dflash::WIN as i64 - 1)).max(0);
-                let bpos: Vec<i64> = (0..tidelm_dflash::BLOCK).map(|i| p0 + i as i64).collect();
+                // The taps hold the residuals of the rows the last pass ran, i.e. positions
+                // p0-1 .. p0+BLOCK-2 -- so the block's row i is at p0-1+i, not p0+i. Declaring the
+                // latter rotated every row a token ahead of its own content: a systematic
+                // off-by-one in both the RoPE and the walker's per-step row, which reads exactly
+                // like a drafter that never guesses right.
+                let bpos: Vec<i64> = (0..tidelm_dflash::BLOCK as i64).map(|i| p0 - 1 + i).collect();
+                // The short seed covers the BLOCK positions before the anchor, which is the window
+                // attention reads. `from` is the first of them: any earlier position in the ring
+                // was never written by this sequence.
+                let bseed: Vec<i64> = (0..tidelm_dflash::BLOCK as i64).map(|i| p0 - tidelm_dflash::BLOCK as i64 + i).collect();
+                let from = bseed[0].max(0);
                 let anchor = runs[blocks[k].i].anchor as i32;
-                let picks = self.eng.dflash_drafts(&[p0], &[from], &bpos, &[anchor])?;
+                let picks = self.eng.dflash_drafts(&[p0], &[from], &bpos, &bseed, &[anchor])?;
                 let dmax = blocks[k].dmax;
                 blocks[k].drafts = picks.into_iter().take(dmax).map(|d| d as u32).collect();
                 blocks[k].qs = vec![None; blocks[k].drafts.len()];

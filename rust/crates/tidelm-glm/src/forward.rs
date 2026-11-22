@@ -837,7 +837,7 @@ impl Engine {
     /// DFlash2's seven drafts for a lane: the block's tables, the ring seeded from the taps the
     /// last verify step captured, one round against the target's own head. Empty when no drafter
     /// is attached, so the caller's loop needs no second condition.
-    pub fn dflash_drafts(&self, starts: &[i64], froms: &[i64], bpos: &[i64], anchors: &[i32]) -> Result<Vec<i32>> {
+    pub fn dflash_drafts(&self, starts: &[i64], froms: &[i64], bpos: &[i64], bseed: &[i64], anchors: &[i32]) -> Result<Vec<i32>> {
         let df = match self.dflash.as_ref() {
             Some(d) => d,
             None => return Ok(Vec::new()),
@@ -846,7 +846,7 @@ impl Engine {
         // join back. Two syncs a round buy isolation from the engine's cublas handle state, which is
         // what the status 13 was.
         self.st.synchronize()?;
-        df.blk.run.set_tables(&df.own, starts, froms, bpos).map_err(|e| format!("dflash tables: {e}"))?;
+        df.blk.run.set_tables(&df.own, starts, froms, bpos, bseed).map_err(|e| format!("dflash tables: {e}"))?;
         df.blk.seed_taps(&df.own, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
         // The target's head is `vl` wide (147,456 at world 1), not the drafter checkpoint's
         // VOCAB: scoring the block over the wrong stride read 68 KB past the logits buffer.

@@ -4156,31 +4156,14 @@ impl Engine {
     /// One lane today: `Block` is opened for `BLOCK * max_lanes` rows but only lane 0's eight are
     /// tapped, and a second stream's rows would be the previous step's. Said out loud rather than
     /// left to look like support for something it does not do.
-    fn dflash_draft(&mut self, reqs: &[(usize, u32, usize)]) -> Result<Vec<Vec<u32>>> {
-        if reqs.len() != 1 {
-            return Err(format!("dflash draft: one lane at a time, got {}", reqs.len()).into());
-        }
-        let anchors: Vec<i32> = reqs.iter().map(|&(_, tok, _)| tok as i32).collect();
-        // The block's eight rows are the positions the target has not written yet: `last` is the
-        // token just accepted, so the drafts sit at last+1 ..= last+8. `froms` is the first key the
-        // drafter may read -- its own window edge, floored at the sequence start.
-        let p_last = reqs[0].2;
-        let p0 = p_last as i64 + 1;
-        let from = (p0 - (tidelm_dflash::WIN as i64 - 1)).max(0);
-        let bpos: Vec<i64> = (0..tidelm_dflash::BLOCK).map(|i| p0 + i as i64).collect();
-        let (st, logits) = (&self.stream, self.act.logits.raw());
-        let df = self.dflash.as_ref().expect("checked above");
-        df.blk.run.set_tables(st, &[p0], &[from], &bpos).map_err(|e| format!("dflash tables: {e}"))?;
-        df.blk.seed_taps(st, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
-        let picks = df.blk.round_bf16(st, &df.blas, &df.dr, logits, &anchors, tidelm_dflash::VOCAB).map_err(|e| format!("dflash: {e}"))?;
-        // picks is [step][stream], step-major
-        let mut out = vec![Vec::with_capacity(tidelm_dflash::BLOCK - 1); reqs.len()];
-        for step in 0..(tidelm_dflash::BLOCK - 1) {
-            for lane in 0..reqs.len() {
-                out[lane].push(picks[step * reqs.len() + lane] as u32);
-            }
-        }
-        Ok(out)
+    fn dflash_draft(&mut self, _reqs: &[(usize, u32, usize)]) -> Result<Vec<Vec<u32>>> {
+        // Not maintained and not reachable: GLM-5.3-Flash is served by `tidelm_glm::forward::Engine`,
+        // whose `Dflash` is the one that has the taps, the tables and the row convention. This copy
+        // was written first, against `act.logits` (bf16) with a head kernel that reads f32, and the
+        // review found it would read `rows * vocab * 4` bytes out of a `rows * vocab * 2` buffer.
+        // Returning an error beats leaving a second answer to "which kernel scores the block"
+        // lying around for someone to call.
+        Err("dflash: this engine's copy is not maintained; see tidelm-glm::forward::Engine".into())
     }
 
     /// `draft_batch` with sampled drafts (fastdecode.py's DRAFT_NUCLEUS draft): per lane

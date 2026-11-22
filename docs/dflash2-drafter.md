@@ -248,3 +248,25 @@ With `st.raw()` there, three passes and two separate processes give the same blo
 `DF_DUMP=1` is what made it visible: the first label (`l0 norm`) already disagreed, which put the
 fault upstream of every layer kernel rather than inside one. The instrumentation stays -- the next
 noon one is inside `embed_taps` or the head, and it costs nothing when the variable is unset.
+
+## The DSpark column, measured before DFlash2 exists
+
+Same box, same prompt ("explain in three sentences why the sky is blue"), temperature 0,
+`max_tokens 128`, three requests, `tidelm-server` on `:8091`, EXL3 pack rebuilt from the
+checkpoint (`glm_pack_exl3.py --mirror`, 97.4 GB, 12384 records, 64 verified):
+
+| | decode | accept/step | steps |
+|---|---|---|---|
+| `--depth 0` (no drafter) | 19.38 / 19.38 / 19.39 tok/s | 1.00 | 127 |
+| `--depth 7` (DSpark)     | 31.31 / 28.45 / 29.82 tok/s | 4.10 / 3.74 / 3.85 | 31 / 34 / 33 |
+
+DSpark is worth **+54 %** on decode here (29.82 vs 19.38 median), and its 3.74-4.10 accepted a
+step is the number the DFlash2 column has to beat: TensorFold measures ~5.5 with DFlash2 on the
+same checkpoint.
+
+**DFlash2 is not in that table, and the first attempt to put it there was wrong.** The round,
+seed, tables and `draft_batch` dispatch went into `tidelm-engine/src/forward.rs`, while the GLM
+serving path builds `tidelm_glm::forward::Engine` (`glm_main.rs` imports it, `Engine::load`). The
+code compiled and was never executed: the boot line the attach prints ("boot: DFlash2 drafter
+...") is what settled it, and every number taken before that line existed was DSpark's. The
+integration belongs in `tidelm-glm/src/forward.rs`, next to `draft_head` / `inkling_draft::draft`.

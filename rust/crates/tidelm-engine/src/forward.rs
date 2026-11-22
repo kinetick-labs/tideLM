@@ -2087,6 +2087,11 @@ impl Engine {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| model_dir.join("../glm53-dflash2"));
             let df = Dflash::open(&dir, &engine.stream, tidelm_dflash::BLOCK * max_lanes)?;
+            // Said out loud at boot: with --depth also on, DSpark is attached too, and the two
+            // drafters are indistinguishable from the outside when only accept rates are printed.
+            println!("boot: DFlash2 drafter {} ({:.2} GiB, {} layers, block {}, {} rows)",
+                     dir.display(), df.dr.nbytes() as f64 / (1u64 << 30) as f64,
+                     tidelm_dflash::LAYERS, tidelm_dflash::BLOCK, tidelm_dflash::BLOCK * max_lanes);
             engine.dflash = Some(df);
         }
         Ok(engine)

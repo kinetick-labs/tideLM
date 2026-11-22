@@ -142,18 +142,21 @@ the target.
 
 ## Where it plugs in, exactly
 
-The serving path is `tidelm-engine::forward` (the server is on `tidelm_engine`), not
-`tidelm-glm`'s Engine; that crate's layer loop is the one to hook. The pieces are done and
-compiled -- `dflash.rs` (weights), `dflash_fwd.rs` (`Run`, `Block`), `dflash.cu` (16 launchers) --
-so the wiring is the remaining work, and it is three edits plus one module:
+The serving path is `tidelm_glm::forward::Engine` (`glm_main`), not `tidelm-engine`. Wiring
+the drafter into `tidelm-engine` compiled and never ran: that crate's `dflash_draft` returns
+an error, and the campaign's numbers all come from the GLM engine. The pieces below describe
+the algorithm; the code that serves it is `tidelm-glm`'s `dflash_drafts` and
+`flash_layer_pre`.
 
-1. **Taps.** In the layer loop, after layer `l`'s residual write, when the drafter is on and
-   `l` is one of `[5, 14, 24, 33, 42]`: `run.tap(st, residual4, slot)`. `residual4` is the
-   mHC path's `[rows][4][D]` buffer -- the same one `df_tap` averages, so no repacking.
-2. **A round.** `tap x5 -> embed_taps -> pass -> the target's head over the 8 rows into the
-   engine's fp32 logits -> candidates -> anchor -> walk -> drafts`. The head stays the
-   target's: the checkpoint has no `lm_head`, and scoring the block through the drafter's
-   own head would be a different distribution than the one it was trained against.
+1. **Taps.** Layers `[5, 14, 24, 33, 42]`, the mean of the four mHC streams, captured when
+   the next layer closes the MLP site (`flash_layer_pre`, the dump labelled `x{l-1}`). A tap
+   after `mlp()` is one site early. The rows go into that lane's window, at `pos[r] % 2048`.
+2. **A round.** The block input is the target's embedding of `[anchor, MASK x 7]`, not
+   `embed_taps`. Context is `kv(rmsnorm(fc(taps)))` written at the context positions, not a
+   block pass. Then the five layers, then the target's head over the drafter's own hidden,
+   then candidates, the anchor and the walk. The head stays the target's: the checkpoint has
+   no `lm_head`. The earlier `embed_taps -> pass` round is what measured accept 1.04; see
+   docs/dflash2-campaign.md.
 3. **The driver.** Mirror `Dspark` in the same file (`dspark: Option<Dspark>`, `dspark_seed`,
    `dspark_draft`, `opts.spec`): a `Dflash` variant with `seed` (the prompt's last `WIN`
    tokens through `ctx_kv` at each layer, into the ring) and `draft` (one round, `BLOCK - 1`

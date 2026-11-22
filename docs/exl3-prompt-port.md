@@ -66,3 +66,11 @@ on the real checkpoint.
 5. Only if that lands: e4m3 (`m16n8k32`) as a second arm, with `tools/exl3_prefill_ref.py` bounding
    what the quantisation costs before any adoption. Not before: it moves values, and the operator's
    rule is that speed may not be bought with quality.
+
+## Not ported in the DFlash2 fix
+
+The kernel in step 1 is still unwritten. This machine has no nvcc and no GB10, so a
+`prefill_pg_kernel` could not be compiled or timed, and shipping it on by default would be a
+numeric change the pair does not report (two ranks that disagree about the tile emit different
+tokens with nothing in the log). The fat tile stays the default. The A/B commands are in
+docs/dflash2-campaign.md. e4m3 stays off for the same reason it was off: it moves values.

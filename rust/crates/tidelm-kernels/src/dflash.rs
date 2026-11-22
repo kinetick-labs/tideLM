@@ -23,6 +23,12 @@ use std::os::raw::{c_int, c_void};
 extern "C" {
     pub fn glm_df_launch_tap_ring(stream: CudaStream, x: *const c_void, pos: *const c_void, out: *mut c_void,
                                   rows: c_int, base: c_int, slot: c_int, win: c_int) -> c_int;
+    /// Row r's closed residual into `wins[lane[r]]`, at `pos[r] % WIN`, tap column `slot`.
+    pub fn glm_df_launch_tap_lanes(stream: CudaStream, x: *const c_void, pos: *const c_void, lane: *const c_void,
+                                   wins: *const c_void, slot: c_int, rows: c_int, nwins: c_int) -> c_int;
+    /// `cin[r] = win[(start + r) % WIN]`, `n` rows of `[5][D]`.
+    pub fn glm_df_launch_win_load(stream: CudaStream, win: *const c_void, start: c_int, cin: *mut c_void, n: c_int)
+        -> c_int;
     pub fn glm_df_launch_tap(stream: CudaStream, x: *const c_void, out: *mut c_void, rows: c_int, slot: c_int,
                              mode: c_int) -> c_int;
     pub fn glm_df_launch_block_qkv(stream: CudaStream, qkv: *const c_void, ldq: c_int, qn: *const c_void,

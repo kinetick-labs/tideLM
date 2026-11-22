@@ -424,6 +424,48 @@ extern "C" int glm_df_launch_tap_ring(cudaStream_t st, const void* x, const void
     return df_check();
 }
 
+// The same mean, into lane[r]'s own window. One ring and one window for every lane wrote lane 1's
+// verify over lane 0's context (GLM_LANES=2). wins[ln] is that lane's [WIN][5][D].
+extern "C" __global__ void glm_df_tap_lanes(const __nv_bfloat16* __restrict__ x, const int* __restrict__ pos,
+                                            const int* __restrict__ lane, const uint64_t* __restrict__ wins,
+                                            int slot, int rows, int nwins) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const int p = pos[r];
+    const int ln = lane[r];
+    if (p < 0 || ln < 0 || ln >= nwins) return;
+    const __nv_bfloat16* xr = x + (long long)r * 4 * D;
+    __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(wins[ln]) + ((long long)(p % WIN) * 5 + slot) * D;
+    for (int d = blockIdx.y * 1024 + threadIdx.x; d < (blockIdx.y + 1) * 1024; d += blockDim.x) {
+        const float a = ((bf(xr[d]) + bf(xr[D + d])) + bf(xr[2 * D + d])) + bf(xr[3 * D + d]);
+        o[d] = tobf(a / 4.0f);
+    }
+}
+
+extern "C" int glm_df_launch_tap_lanes(cudaStream_t st, const void* x, const void* pos, const void* lane,
+                                       const void* wins, int slot, int rows, int nwins) {
+    glm_df_tap_lanes<<<dim3(rows, D / 1024), 256, 0, st>>>((const __nv_bfloat16*)x, (const int*)pos,
+                                                          (const int*)lane, (const uint64_t*)wins, slot, rows, nwins);
+    return df_check();
+}
+
+// cin[r] = win[(start + r) % WIN], the five taps of one context position, packed [n][5][D].
+// 5 * D is 20 tiles of 1024.
+extern "C" __global__ void glm_df_win_load(const __nv_bfloat16* __restrict__ win, int start,
+                                           __nv_bfloat16* __restrict__ cin, int n) {
+    const int r = blockIdx.x;
+    if (r >= n) return;
+    const int slot = (int)(((long long)start + r) % WIN);
+    const __nv_bfloat16* s = win + (long long)slot * 5 * D;
+    __nv_bfloat16* d = cin + (long long)r * 5 * D;
+    for (int c = blockIdx.y * 1024 + threadIdx.x; c < (blockIdx.y + 1) * 1024; c += blockDim.x) d[c] = s[c];
+}
+
+extern "C" int glm_df_launch_win_load(cudaStream_t st, const void* win, int start, void* cin, int n) {
+    glm_df_win_load<<<dim3(n, 5 * D / 1024), 256, 0, st>>>((const __nv_bfloat16*)win, start, (__nv_bfloat16*)cin, n);
+    return df_check();
+}
+
 extern "C" int glm_df_launch_block_qkv(cudaStream_t st, const void* qkv, int ldq, const void* qn, const void* kn,
                                        const void* pos, int rows, float eps, float theta, void* q, void* kb, void* vb) {
     glm_df_block_qkv<<<dim3(rows, QH + KVH), 64, 0, st>>>((const __nv_bfloat16*)qkv, ldq, (const __nv_bfloat16*)qn,
@@ -561,6 +603,9 @@ extern "C" __global__ void __launch_bounds__(256) glm_df_select(const __nv_bfloa
         int best = 0;
         for (int i = 1; i < TOP; ++i)
             if (sc[i] > sc[best]) best = i;
+        // The token id, not the slot. A run that emitted 8, 0, 13, 4 was a bad distribution
+        // (the campaign's 1.04), and those values are legal token ids. Writing `best` here
+        // would make every draft a rank in 0..15.
         out[s] = cand[r * 2 * TOP + best];
     }
 }

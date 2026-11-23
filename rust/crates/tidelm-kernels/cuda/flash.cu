@@ -283,142 +283,165 @@ __global__ void __launch_bounds__(kD * SP) kda_chain_kernel(
     for (int j = 0; j < KS; ++j) sout[(k0 + j) * kD + v] = S[j];
 }
 
-// ------------------------------------------------------------------ KDA prefill in three phases (prefill-pg)
+// ------------------------------------------------------------------ KDA prefill (prefill-pg)
 // kda_chain_kernel spends a row ~1.5 us of mostly barriers: two block reductions (the q / k norms,
 // the output's RMS) and a broadcast, five __syncthreads a row, all on the serial chain. Only the
-// delta rule itself needs the state, so a prefill (one lane, no saved rows) runs it in three:
-//   prep  (row, head) blocks: k / q normalized, exp(g), beta - kda_chain's code and reduction order
-//   scan  one block a head: the delta rule and o = bf16(S q) only, inputs staged KR rows at a time
-//         (one barrier a tile), o written into y
-//   onorm (row, head) blocks: y = the gated RMS norm of o - kda_chain's code and reduction order
-// Bit for bit kda_chain's y and state: the same operations in the same order, only where the
-// state-free parts run differs. Rows go in blocks of KB (the staging is KB rows of fp32).
-constexpr int KR = 8, KB = 512;
+// delta rule itself needs the state.
+// KDA prefill for one lane (T > 64 rows), kda_chain's math in two kernels:
+//   kda_vsplit: the delta rule, one block a (head, 1/VS of the value columns) - the columns are
+//     independent; 128 half-head blocks, two an SM, balance the 48 SMs better than 64 whole heads
+//     at one an SM (the delta rule is bound by shared-memory reads of k / exp(g) / q).
+//     kD / VS * SP compute threads run kda_step over KR-row tiles staged in shared memory while KP
+//     producer warps stage the next tile (k / q norms, exp(g), beta: a warp a row, its four 32-wide
+//     sums added in kda_chain's block_sum2 order). o = bf16(S q) goes to y.
+//   kda_onorm_w: the gated RMS norm of y in place, a warp a (row, head), kda_chain's sum order.
+// Bit-identical to kda_chain (y and the state).
+#ifndef KDA_KR
+#define KDA_KR 8
+#endif
+#ifndef KDA_KP
+#define KDA_KP 2
+#endif
+#ifndef KDA_MINB
+#define KDA_MINB 2
+#endif
+#ifndef KDA_VS
+#define KDA_VS 2
+#endif
+constexpr int KR = KDA_KR, KP = KDA_KP, KVS = KDA_VS;
 
 template <int SP>
-__global__ void __launch_bounds__(kD * SP) kda_prep_kernel(
+__global__ void __launch_bounds__(kD / KVS * SP + 32 * KP, KDA_MINB) kda_vsplit_kernel(
     const bf16* __restrict__ qkv, int64_t ldq, int dl, const bf16* __restrict__ f, int64_t ldf, const bf16* __restrict__ b,
-    int64_t ldb, const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower, const int* __restrict__ lanes,
-    int r0, float* __restrict__ kk_s, float* __restrict__ qq_s, float* __restrict__ gg_s, float* __restrict__ beta_s, int hl) {
+    int64_t ldb, const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower, float* __restrict__ state,
+    int64_t slot_stride, const int* __restrict__ lanes, const int* __restrict__ meta, bf16* __restrict__ y, int64_t ldy) {
     pdl_enter();
-    constexpr int NW = kD * SP / 32;
-    __shared__ float2 red[NW];
-    const int h = blockIdx.x, i = blockIdx.y, tid = threadIdx.x;
-    if (r0 + i >= lanes[1]) return;
-    const int64_t t = lanes[0] + r0 + i;
-    const bool io = tid < kD;
-    const float rate = expf(a_log[h]);
-    const float dtb = io ? dt_bias[h * kD + tid] : 0.f;
-    const bf16 z = __float2bfloat16_rn(0.f);
-    const bf16 xq = io ? qkv[t * ldq + h * kD + tid] : z;
-    const bf16 xk = io ? qkv[t * ldq + dl + h * kD + tid] : z;
-    const bf16 xf = io ? f[t * ldf + h * kD + tid] : z;
-    const float qv = bf(xq), kv = bf(xk);
-    const float2 ss = block_sum2<NW>(kv * kv, qv * qv, red);
-    const float beta = rbf(sigmoidf_(bf(b[t * ldb + h])));
-    if (io) {
-        const float kn = kv / sqrtf(ss.x + 1e-6f);
-        const float qn = qv / sqrtf(ss.y + 1e-6f) * 0.08838834764831845f;
-        const float g = lower * sigmoidf_(rate * (bf(xf) + dtb));
-        const int64_t o = ((int64_t)i * hl + h) * kD + tid;
-        kk_s[o] = kn;
-        qq_s[o] = qn;
-        gg_s[o] = expf(g);
-        if (tid == 0) beta_s[(int64_t)i * hl + h] = beta;
-    }
-}
-
-__device__ __forceinline__ void kda_cp16(void* dst, const void* src) {
-    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
-}
-
-template <int SP>
-__global__ void __launch_bounds__(kD * SP) kda_scan_kernel(
-    const bf16* __restrict__ qkv, int64_t ldq, int dl, const float* __restrict__ kk_s, const float* __restrict__ qq_s,
-    const float* __restrict__ gg_s, const float* __restrict__ beta_s, float* __restrict__ state, int64_t slot_stride,
-    const int* __restrict__ lanes, const int* __restrict__ meta, int first, int r0, int cnt, bf16* __restrict__ y,
-    int64_t ldy, int hl) {
-    pdl_enter();
-    constexpr int KS = kD / SP, NT = kD * SP;
+    constexpr int KS = kD / SP, NT = kD / KVS * SP;
     __shared__ __align__(16) float sk[2][KR][kD], sq[2][KR][kD], sg[2][KR][kD];
     __shared__ __align__(16) bf16 sv[2][KR][kD];
     __shared__ float sb[2][KR];
     const int h = blockIdx.x, tid = threadIdx.x;
-    const int v = tid / SP, k0 = (tid % SP) * KS;
-    const int n = min(cnt, lanes[1] - r0);
+    const int n = lanes[1];
     if (n <= 0) return;
-    const int64_t t0 = lanes[0] + r0;
-    const float* sin = state + (int64_t)meta[first ? 1 : 2] * slot_stride + (int64_t)h * kD * kD;
-    float* sout = state + (int64_t)meta[2] * slot_stride + (int64_t)h * kD * kD;
-    float S[KS];
-#pragma unroll
-    for (int j = 0; j < KS; ++j) S[j] = sin[(k0 + j) * kD + v];
+    const int64_t t0 = lanes[0];
     const int tiles = (n + KR - 1) / KR;
-    auto load = [&](int buf, int tile) {
+    const bool prod = tid >= NT;
+    const int pw = (tid - NT) >> 5, l = tid & 31;
+    const int v = blockIdx.y * (kD / KVS) + tid / SP, k0 = (tid % SP) * KS;
+
+    auto prep = [&](int buf, int tile) {
+        const float rate = expf(a_log[h]);
         const int rows = min(KR, n - tile * KR);
-        // fp32 rows: 32 chunks of 16 B each, three arrays
-        for (int c = tid; c < 3 * KR * 32; c += NT) {
-            const int a = c / (KR * 32), r = (c / 32) % KR, q = c % 32;
-            if (r >= rows) continue;
-            const int64_t o = ((int64_t)(tile * KR + r) * hl + h) * kD + q * 4;
-            float* dst = (a == 0 ? &sk[buf][r][0] : a == 1 ? &sq[buf][r][0] : &sg[buf][r][0]) + q * 4;
-            kda_cp16(dst, (a == 0 ? kk_s : a == 1 ? qq_s : gg_s) + o);
+        for (int r = pw; r < rows; r += KP) {
+            const int64_t t = t0 + tile * KR + r;
+            const bf16* row = qkv + t * ldq + h * kD;
+            float qv[4], kv[4], fv[4], dv[4];
+            bf16 vv[4];
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const int e = 32 * g + l;
+                qv[g] = bf(row[e]);
+                kv[g] = bf(row[dl + e]);
+                vv[g] = row[2 * dl + e];
+                fv[g] = bf(f[t * ldf + h * kD + e]);
+                dv[g] = dt_bias[h * kD + e];
+            }
+            const float beta = rbf(sigmoidf_(bf(b[t * ldb + h])));
+            float sx = warp_sum(kv[0] * kv[0]), sy_ = warp_sum(qv[0] * qv[0]);
+#pragma unroll
+            for (int g = 1; g < 4; ++g) {
+                sx += warp_sum(kv[g] * kv[g]);
+                sy_ += warp_sum(qv[g] * qv[g]);
+            }
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const int e = 32 * g + l;
+                const float kn = kv[g] / sqrtf(sx + 1e-6f);
+                const float qn = qv[g] / sqrtf(sy_ + 1e-6f) * 0.08838834764831845f;
+                const float gg = lower * sigmoidf_(rate * (fv[g] + dv[g]));
+                sk[buf][r][e] = kn;
+                sq[buf][r][e] = qn;
+                sg[buf][r][e] = expf(gg);
+                sv[buf][r][e] = vv[g];
+            }
+            if (l == 0) sb[buf][r] = beta;
         }
-        for (int c = tid; c < KR * 16; c += NT) {
-            const int r = c / 16, q = c % 16;
-            if (r >= rows) continue;
-            kda_cp16(&sv[buf][r][q * 8], qkv + (t0 + tile * KR + r) * ldq + 2 * dl + h * kD + q * 8);
-        }
-        if (tid < rows) sb[buf][tid] = beta_s[(int64_t)(tile * KR + tid) * hl + h];
-        asm volatile("cp.async.commit_group;\n" ::);
     };
-    load(0, 0);
+
+    float S[KS];
+    if (!prod) {
+        const float* sin = state + (int64_t)meta[1] * slot_stride + (int64_t)h * kD * kD;
+#pragma unroll
+        for (int j = 0; j < KS; ++j) S[j] = sin[(k0 + j) * kD + v];
+    } else {
+        prep(0, 0);
+    }
+    __syncthreads();
     for (int tile = 0; tile < tiles; ++tile) {
         const int buf = tile & 1;
-        asm volatile("cp.async.wait_group 0;\n" ::);
-        __syncthreads();                 // this tile staged; the other buffer's last reads are done
-        if (tile + 1 < tiles) load(buf ^ 1, tile + 1);
-        const int rows = min(KR, n - tile * KR);
-        for (int r = 0; r < rows; ++r) {
-            kda_step<SP>(S, &sk[buf][r][k0], &sg[buf][r][k0], bf(sv[buf][r][v]), sb[buf][r]);
-            const float* qq = &sq[buf][r][0];
-            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+        if (!prod) {
+            const int rows = min(KR, n - tile * KR);
+            for (int r = 0; r < rows; ++r) {
+                kda_step<SP>(S, &sk[buf][r][k0], &sg[buf][r][k0], bf(sv[buf][r][v]), sb[buf][r]);
+                const float* qq = &sq[buf][r][k0];
+                float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
 #pragma unroll
-            for (int j = 0; j < KS; j += 4) {
-                o0 = fmaf(S[j], qq[k0 + j], o0);
-                o1 = fmaf(S[j + 1], qq[k0 + j + 1], o1);
-                o2 = fmaf(S[j + 2], qq[k0 + j + 2], o2);
-                o3 = fmaf(S[j + 3], qq[k0 + j + 3], o3);
+                for (int j = 0; j < KS; j += 4) {
+                    const float4 q4 = *reinterpret_cast<const float4*>(qq + j);
+                    o0 = fmaf(S[j], q4.x, o0);
+                    o1 = fmaf(S[j + 1], q4.y, o1);
+                    o2 = fmaf(S[j + 2], q4.z, o2);
+                    o3 = fmaf(S[j + 3], q4.w, o3);
+                }
+                float o = (o0 + o1) + (o2 + o3);
+#pragma unroll
+                for (int x = 1; x < SP; x <<= 1) o += __shfl_xor_sync(0xffffffffu, o, x);
+                if (tid % SP == 0) y[(t0 + tile * KR + r) * ldy + h * kD + v] = to_bf(o);
             }
-            float o = (o0 + o1) + (o2 + o3);
-#pragma unroll
-            for (int x = 1; x < SP; x <<= 1) o += __shfl_xor_sync(0xffffffffu, o, x);
-            if (tid % SP == 0) y[(t0 + tile * KR + r) * ldy + h * kD + v] = to_bf(o);
+        } else if (tile + 1 < tiles) {
+            prep(buf ^ 1, tile + 1);
         }
+        __syncthreads();
     }
+    if (!prod) {
+        float* sout = state + (int64_t)meta[2] * slot_stride + (int64_t)h * kD * kD;
 #pragma unroll
-    for (int j = 0; j < KS; ++j) sout[(k0 + j) * kD + v] = S[j];
+        for (int j = 0; j < KS; ++j) sout[(k0 + j) * kD + v] = S[j];
+    }
 }
 
+// y = the gated RMS norm of o (in y), a warp a (row, head): kda_chain's block_sum2 over its kD * SP
+// threads (value v on thread SP v, NW warps) replayed group by group in one warp.
 template <int SP>
-__global__ void __launch_bounds__(kD * SP) kda_onorm_kernel(const bf16* __restrict__ gt, int64_t ldg,
-    const bf16* __restrict__ onorm, float eps, const int* __restrict__ lanes, int r0, bf16* __restrict__ y, int64_t ldy) {
+__global__ void __launch_bounds__(256) kda_onorm_w_kernel(const bf16* __restrict__ gt, int64_t ldg, const bf16* __restrict__ onorm,
+                                                          float eps, const int* __restrict__ lanes, int hl, bf16* __restrict__ y,
+                                                          int64_t ldy) {
     pdl_enter();
     constexpr int NW = kD * SP / 32;
-    __shared__ float2 red[NW];
-    const int h = blockIdx.x, i = blockIdx.y, tid = threadIdx.x;
-    if (r0 + i >= lanes[1]) return;
-    const int64_t t = lanes[0] + r0 + i;
-    const int v = tid / SP;
-    const float ob = bf(y[t * ldy + h * kD + v]);
-    const float wn = bf(onorm[v]);
-    const float2 so = block_sum2<NW>(tid % SP == 0 ? ob * ob : 0.f, 0.f, red);
-    if (tid % SP == 0) {
-        float yv = ob * rsqrtf(so.x * (1.f / kD) + eps);
-        yv = wn * yv;
-        yv = yv * sigmoidf_(bf(gt[t * ldg + h * kD + v]));
-        y[t * ldy + h * kD + v] = to_bf(yv);
+    const int item = blockIdx.x * 8 + (threadIdx.x >> 5), l = threadIdx.x & 31;
+    const int i = item / hl, h = item % hl;
+    if (i >= lanes[1]) return;
+    const int64_t t = lanes[0] + i;
+    bf16* yr = y + t * ldy + h * kD;
+    float ob[NW];
+    float s = 0.f;
+#pragma unroll
+    for (int w = 0; w < NW; ++w) ob[w] = bf(yr[(32 * w + l) / SP]);
+#pragma unroll
+    for (int w = 0; w < NW; ++w) {
+        const float a = warp_sum(l % SP == 0 ? ob[w] * ob[w] : 0.f);
+        s = w == 0 ? a : s + a;
+    }
+    __syncwarp();
+    if (l % SP == 0) {
+#pragma unroll
+        for (int w = 0; w < NW; ++w) {
+            const int vo = (32 * w + l) / SP;
+            float yv = ob[w] * rsqrtf(s * (1.f / kD) + eps);
+            yv = bf(onorm[vo]) * yv;
+            yv = yv * sigmoidf_(bf(gt[t * ldg + h * kD + vo]));
+            yr[vo] = to_bf(yv);
+        }
     }
 }
 
@@ -967,34 +990,17 @@ int flash_kda_chain_t(void* stream, const void* qkv, int64_t ldq, int dl, const 
     if (!on || nl != 1 || save_k || T <= 64 || dl != hl * kD || !al)
         return flash_kda_chain(stream, qkv, ldq, dl, f, ldf, b, ldb, gt, ldg, a_log, dt_bias, onorm, lower, eps, state,
                                slot_stride, lanes, nl, meta, y, ldy, save_k, save_g, save_v, save_b, save_lane, R, hl);
-    static float* scr = nullptr;
-    static size_t scr_n = 0;
-    const size_t need = (size_t)KB * hl * kD * 3 + (size_t)KB * hl;
-    if (scr_n < need) {
-        if (scr) cudaFree(scr);
-        if (cudaMalloc(&scr, need * sizeof(float)) != cudaSuccess) { scr = nullptr; scr_n = 0; return (int)cudaErrorMemoryAllocation; }
-        scr_n = need;
-    }
-    float* kk = scr;
-    float* qq = kk + (size_t)KB * hl * kD;
-    float* gg = qq + (size_t)KB * hl * kD;
-    float* bb = gg + (size_t)KB * hl * kD;
     const int* ln = static_cast<const int*>(lanes);
-    for (int r0 = 0; r0 < T; r0 += KB) {
-        const int cnt = T - r0 < KB ? T - r0 : KB;
-        auto go = [&](auto prep, auto scan, auto onrm, int sp) {
-            pdl_launch(prep, dim3(hl, cnt), kD * sp, 0, GST, static_cast<const bf16*>(qkv), ldq, dl, static_cast<const bf16*>(f), ldf,
-                       static_cast<const bf16*>(b), ldb, static_cast<const float*>(a_log), static_cast<const float*>(dt_bias), lower,
-                       ln, r0, kk, qq, gg, bb, hl);
-            pdl_launch(scan, dim3(hl), kD * sp, 0, GST, static_cast<const bf16*>(qkv), ldq, dl, (const float*)kk, (const float*)qq,
-                       (const float*)gg, (const float*)bb, static_cast<float*>(state), slot_stride, ln, static_cast<const int*>(meta),
-                       r0 == 0 ? 1 : 0, r0, cnt, static_cast<bf16*>(y), ldy, hl);
-            pdl_launch(onrm, dim3(hl, cnt), kD * sp, 0, GST, static_cast<const bf16*>(gt), ldg, static_cast<const bf16*>(onorm), eps,
-                       ln, r0, static_cast<bf16*>(y), ldy);
-        };
-        if (g_kda_split == 4) go(kda_prep_kernel<4>, kda_scan_kernel<4>, kda_onorm_kernel<4>, 4);
-        else go(kda_prep_kernel<2>, kda_scan_kernel<2>, kda_onorm_kernel<2>, 2);
-    }
+    auto go = [&](auto scan, auto onrm, int sp) {
+        pdl_launch(scan, dim3(hl, KVS), kD / KVS * sp + 32 * KP, 0, GST, static_cast<const bf16*>(qkv), ldq, dl,
+                   static_cast<const bf16*>(f), ldf, static_cast<const bf16*>(b), ldb, static_cast<const float*>(a_log),
+                   static_cast<const float*>(dt_bias), lower, static_cast<float*>(state), slot_stride, ln,
+                   static_cast<const int*>(meta), static_cast<bf16*>(y), ldy);
+        pdl_launch(onrm, dim3((T * hl + 7) / 8), 256, 0, GST, static_cast<const bf16*>(gt), ldg, static_cast<const bf16*>(onorm),
+                   eps, ln, hl, static_cast<bf16*>(y), ldy);
+    };
+    if (g_kda_split == 4) go(kda_vsplit_kernel<4>, kda_onorm_w_kernel<4>, 4);
+    else go(kda_vsplit_kernel<2>, kda_onorm_w_kernel<2>, 2);
     GRET;
 }
 

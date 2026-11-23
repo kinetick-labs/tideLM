@@ -588,10 +588,10 @@ impl Engine {
             ck(flash_kda_conv(st, np(&fa.proj), ldq as i64, np(&k.conv), c as i32, conv, slot_c, lanes, nl, meta, t as i32, np(&fa.act),
                               c as i64, sr, (lk * c) as i64, SAVE_ROWS as i32), "kda conv")?;
             ck(flash_kda_conv_state(st, np(&fa.proj), ldq as i64, c as i32, conv, slot_c, lanes, nl, meta), "kda conv state")?;
-            ck(flash_kda_chain(st, np(&fa.act), c as i64, dl as i32, np(&fa.f), dl as i64, at(&fa.proj, off[5]), ldq as i64, np(&fa.gt),
-                               dl as i64, np(&k.a_log), np(&k.dt_bias), np(&k.o_norm), self.cfg.kda.unwrap().lower, self.cfg.rms_eps,
-                               state, slot_f, lanes, nl, meta, np(&fa.y), dl as i64, sk, sg, sv, sb, (lk * dl) as i64,
-                               SAVE_ROWS as i32, khl as i32), "kda chain")?;
+            ck(flash_kda_chain_t(st, np(&fa.act), c as i64, dl as i32, np(&fa.f), dl as i64, at(&fa.proj, off[5]), ldq as i64, np(&fa.gt),
+                                 dl as i64, np(&k.a_log), np(&k.dt_bias), np(&k.o_norm), self.cfg.kda.unwrap().lower, self.cfg.rms_eps,
+                                 state, slot_f, lanes, nl, meta, np(&fa.y), dl as i64, sk, sg, sv, sb, (lk * dl) as i64,
+                                 SAVE_ROWS as i32, khl as i32, t as i32), "kda chain")?;
         }
         self.lin(&k.o, np(&fa.y), dl, t, np(&a.f32buf), false)?;
         self.allreduce(np(&a.f32buf), t * h, np(&a.a), prefill)

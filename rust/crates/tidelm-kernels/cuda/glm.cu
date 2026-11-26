@@ -885,14 +885,13 @@ __global__ void kvb_dequant_kernel(const uint8_t* __restrict__ w, const float* _
 // koff (null: 0): row t's keys are its lane's cache rows, koff[t] on (positions_kernel).
 constexpr int kMNT = 32, kMPS = kMNT + 4;
 
-template <int MT, int RP = 8, int NT = kMNT>
+template <int MT, int RP = 8>
 constexpr int mla_smem() {
-    return (16 * MT + NT) * (kLat + 8 * RP + 8) * 2 + 16 * MT * (NT + 4) * 4 + 3 * 16 * MT * 4 + 2 * NT * 4;
+    return (16 * MT + kMNT) * (kLat + 8 * RP + 8) * 2 + 16 * MT * kMPS * 4 + 3 * 16 * MT * 4 + 2 * kMNT * 4;
 }
 
 // RP: the RoPE pieces (8 bf16) a key after its 32 latent pieces of 16 FP8: 8 for GLM-5.3, 0 for GLM-5.3-Flash
-// NT: keys a tile (kMNT; mla-fp8k's opt-in 64-head block, MT 4, takes 16 so its tiles fit beside 64 query heads)
-template <int MT, int RP, int NT = kMNT>
+template <int MT, int RP>
 __global__ void __launch_bounds__(256) mla_kernel(
     const __nv_bfloat16* __restrict__ q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg,
     const uint8_t* __restrict__ cq, const float* __restrict__ cs, const __nv_bfloat16* __restrict__ cr, int split_n,
@@ -902,13 +901,11 @@ __global__ void __launch_bounds__(256) mla_kernel(
     pdl_enter();
     constexpr int kMD = kLat + 8 * RP, kMLD = kMD + 8, kNP = 32 + RP;
     constexpr int HB = 16 * MT;
-    constexpr int kPS = NT + 4;
-    static_assert(NT == 32 || NT == 16, "a tile is a warp's lanes or half of them");
     extern __shared__ __align__(16) unsigned char mla_smem_raw[];
     __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(mla_smem_raw);   // [HB][kMLD]
     __nv_bfloat16* Ks = Qs + HB * kMLD;                                    // [NT][kMLD]
-    float* Ps = reinterpret_cast<float*>(Ks + NT * kMLD);               // [HB][PS]
-    float* m_run = Ps + HB * kPS;
+    float* Ps = reinterpret_cast<float*>(Ks + kMNT * kMLD);               // [HB][PS]
+    float* m_run = Ps + HB * kMPS;
     float* l_run = m_run + HB;
     float* alpha = l_run + HB;
     int* valid = reinterpret_cast<int*>(alpha + HB);
@@ -958,8 +955,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
     // off (--probe 31) the kernel still takes 17 / 59 us at 1 / 4 rows - the per-block skeleton of
     // one 80 KB-smem block an SM in 3 waves, its syncs, softmax and partial stores - so the next
     // lever here is two blocks an SM (FP8-staged keys), not deeper loads.
-    constexpr int kPieces = NT * kNP / 256;
-    static_assert(kPieces * 256 == NT * kNP, "a tile's pieces over the threads");
+    constexpr int kPieces = kMNT * kNP / 256;
     constexpr int kPF = 1;
     uint4 pre_raw[kPF][kPieces];
     float pre_s[kPF][kPieces];
@@ -1018,12 +1014,12 @@ __global__ void __launch_bounds__(256) mla_kernel(
     };
 #pragma unroll
     for (int sl = 0; sl < kPF; ++sl)
-        if (k_lo + sl * NT < k_hi) prefetch(k_lo + sl * NT, pre_raw[sl], pre_s[sl], pre_ok[sl]);
-    keyld(k_lo + kPF * NT, pre_key);
-    for (int nb = k_lo; nb < k_hi; nb += kPF * NT) {
+        if (k_lo + sl * kMNT < k_hi) prefetch(k_lo + sl * kMNT, pre_raw[sl], pre_s[sl], pre_ok[sl]);
+    keyld(k_lo + kPF * kMNT, pre_key);
+    for (int nb = k_lo; nb < k_hi; nb += kPF * kMNT) {
 #pragma unroll
     for (int sl = 0; sl < kPF; ++sl) {
-        const int n0 = nb + sl * NT;
+        const int n0 = nb + sl * kMNT;
         if (n0 >= k_hi) break;
         __syncthreads();  // the previous tile's PV is done with Ks / Ps
 #pragma unroll
@@ -1040,13 +1036,13 @@ __global__ void __launch_bounds__(256) mla_kernel(
             if (c == 0) valid[j] = pre_ok[sl][u];
         }
         __syncthreads();
-        if (n0 + kPF * NT < k_hi) {
+        if (n0 + kPF * kMNT < k_hi) {
             prefetch_k(pre_key, pre_raw[sl], pre_s[sl], pre_ok[sl]);
-            keyld(n0 + 2 * kPF * NT, pre_key);
+            keyld(n0 + 2 * kPF * kMNT, pre_key);
         }
         // scores: (m tile, 8 keys) jobs over the warps
-        for (int job = warp; job < MT * (NT / 8); job += 8) {
-            const int mt = job / (NT / 8), kb = job % (NT / 8);
+        for (int job = warp; job < MT * (kMNT / 8); job += 8) {
+            const int mt = job / (kMNT / 8), kb = job % (kMNT / 8);
             float c4[4] = {0.f, 0.f, 0.f, 0.f};
             const __nv_bfloat16* kn = Ks + (kb * 8 + r) * kMLD;
             const __nv_bfloat16* qa = Qs + (mt * 16) * kMLD;
@@ -1066,11 +1062,11 @@ __global__ void __launch_bounds__(256) mla_kernel(
             }
             (void)kn;
             const int k0 = kb * 8 + 2 * qd;
-            float* pr = Ps + (mt * 16) * kPS;
-            pr[r * kPS + k0] = valid[k0] ? c4[0] * scale : -INFINITY;
-            pr[r * kPS + k0 + 1] = valid[k0 + 1] ? c4[1] * scale : -INFINITY;
-            pr[(r + 8) * kPS + k0] = valid[k0] ? c4[2] * scale : -INFINITY;
-            pr[(r + 8) * kPS + k0 + 1] = valid[k0 + 1] ? c4[3] * scale : -INFINITY;
+            float* pr = Ps + (mt * 16) * kMPS;
+            pr[r * kMPS + k0] = valid[k0] ? c4[0] * scale : -INFINITY;
+            pr[r * kMPS + k0 + 1] = valid[k0 + 1] ? c4[1] * scale : -INFINITY;
+            pr[(r + 8) * kMPS + k0] = valid[k0] ? c4[2] * scale : -INFINITY;
+            pr[(r + 8) * kMPS + k0 + 1] = valid[k0 + 1] ? c4[3] * scale : -INFINITY;
         }
         __syncthreads();
         // online softmax: a warp takes 2 * MT heads, a lane one key
@@ -1082,7 +1078,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
             for (int u = 0; u < NU; ++u) {
                 const int hh = warp * NU + u;
                 mo[u] = m_run[hh];
-                s0[u] = (NT == 32 || lane < NT) ? Ps[hh * kPS + lane] : -INFINITY;
+                s0[u] = Ps[hh * kMPS + lane];
                 mn[u] = s0[u];
             }
 #pragma unroll
@@ -1102,7 +1098,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
 #pragma unroll
             for (int u = 0; u < NU; ++u) {
                 const int hh = warp * NU + u;
-                if (NT == 32 || lane < NT) Ps[hh * kPS + lane] = e0[u];
+                Ps[hh * kMPS + lane] = e0[u];
                 if (lane == 0) {
                     const float al = expf(mo[u] - mn[u]);
                     alpha[hh] = al;
@@ -1125,13 +1121,13 @@ __global__ void __launch_bounds__(256) mla_kernel(
         }
         // PV: warp w takes latent dims w * 64 .. + 64; p rounded to bf16 (as tl.dot(p.to(bf16), c))
 #pragma unroll
-        for (int ks = 0; ks < ((c_mla_probe & 4) ? 0 : NT / 16); ++ks) {
+        for (int ks = 0; ks < ((c_mla_probe & 4) ? 0 : kMNT / 16); ++ks) {
             const int k0 = ks * 16;
             uint32_t ah[MT][4];
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
-                const float* pr0 = Ps + (mt * 16 + r) * kPS + k0 + 2 * qd;
-                const float* pr1 = Ps + (mt * 16 + r + 8) * kPS + k0 + 2 * qd;
+                const float* pr0 = Ps + (mt * 16 + r) * kMPS + k0 + 2 * qd;
+                const float* pr1 = Ps + (mt * 16 + r + 8) * kMPS + k0 + 2 * qd;
                 ah[mt][0] = pack_bf16(pr0[0], pr0[1]);
                 ah[mt][1] = pack_bf16(pr1[0], pr1[1]);
                 ah[mt][2] = pack_bf16(pr0[8], pr0[9]);
@@ -1178,6 +1174,321 @@ __global__ void __launch_bounds__(256) mla_kernel(
     if (halfp) {
         // each head's split output normalized by its own l (fp16 then holds values the size of
         // the latents, not of their sum); nothing attended: l = 0, the partial 0
+        if (tid < HB) alpha[tid] = l_run[tid] > 0.f ? 1.f / l_run[tid] : 0.f;
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int d = warp * 64 + nt * 8 + 2 * qd;
+            const int ha = mt * 16 + r, hb = ha + 8;
+            if (ha < nh) {
+                const int64_t at = (((int64_t)t * H + h0 + ha) * NS + sp) * kLat + d;
+                if (halfp) {
+                    *reinterpret_cast<__half2*>(reinterpret_cast<__half*>(part_acc) + at) =
+                        __floats2half2_rn(acc[mt][nt][0] * alpha[ha], acc[mt][nt][1] * alpha[ha]);
+                } else {
+                    part_acc[at] = acc[mt][nt][0];
+                    part_acc[at + 1] = acc[mt][nt][1];
+                }
+            }
+            if (hb < nh) {
+                const int64_t at = (((int64_t)t * H + h0 + hb) * NS + sp) * kLat + d;
+                if (halfp) {
+                    *reinterpret_cast<__half2*>(reinterpret_cast<__half*>(part_acc) + at) =
+                        __floats2half2_rn(acc[mt][nt][2] * alpha[hb], acc[mt][nt][3] * alpha[hb]);
+                } else {
+                    part_acc[at] = acc[mt][nt][2];
+                    part_acc[at + 1] = acc[mt][nt][3];
+                }
+            }
+        }
+}
+
+// mla-fp8k (TIDELM_MLA_FP8K=1, GLM-5.3-Flash: RP 0): mla_kernel over all 64 heads of a row in one block,
+// the 32-key tile staged as its raw FP8 bytes (and the keys' 128-block scales) instead of widened BF16,
+// so the 64 query heads fit beside it: each key is fetched once a row instead of once a 32-head block,
+// and the fixed per-tile work (barriers, staging, partial stores) runs half as often. The BF16 key
+// values are made where an mma reads them, bf16(e4m3 * scale) as fp8x16_bf16: the same operands, the
+// same k order and the same per-head softmax as mla_kernel<2, 0>, so the same bits.
+// Staged key row: 16 chunks of 32 bytes; a chunk's byte for d offset o sits at
+// ((o & 7) >> 1) * 8 + (o >> 3) * 2 + (o & 1), so a lane's score B fragments for two k16 steps are one
+// 8-byte load, and a PV lane's four n8 columns of one key and chunk are one 8-byte load too.
+constexpr int kF8RS = 544;   // bytes a staged key row (512 + 32: two 8-byte loads a 16-lane phase hit 32 banks)
+constexpr int mla_f8_smem() {
+    return 64 * (kLat + 8) * 2 + kMNT * kF8RS + kMNT * 4 * 4 + 64 * kMPS * 4 + 3 * 64 * 4 + 2 * kMNT * 4;
+}
+__device__ __forceinline__ uint32_t f8pair_bf16(uint32_t lo, uint32_t hi, float slo, float shi) {
+    return pack_bf16(e4m3((uint8_t)lo) * slo, e4m3((uint8_t)hi) * shi);
+}
+
+__global__ void __launch_bounds__(256) mla_f8_kernel(
+    const __nv_bfloat16* __restrict__ q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg,
+    const uint8_t* __restrict__ cq, const float* __restrict__ cs, int split_n,
+    const int* __restrict__ idx, int64_t ld_idx, int K, int ascending, const int* __restrict__ bound, int H, float scale,
+    int chunk, float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    __nv_bfloat16* __restrict__ out, int64_t o_ldt, int64_t o_ldh, const int* __restrict__ koff) {
+    pdl_enter();
+    constexpr int MT = 4, HB = 64, NT = kMNT, kMLD = kLat + 8, kNP = 32;
+    extern __shared__ __align__(16) unsigned char mla_smem_raw[];
+    __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(mla_smem_raw);   // [64][kMLD]
+    unsigned char* K8 = reinterpret_cast<unsigned char*>(Qs + HB * kMLD);  // [NT][kF8RS]
+    float* Sk = reinterpret_cast<float*>(K8 + NT * kF8RS);                // [NT][4] the keys' block scales
+    float* Ps = Sk + NT * 4;                                               // [HB][kMPS]
+    float* m_run = Ps + HB * kMPS;
+    float* l_run = m_run + HB;
+    float* alpha = l_run + HB;
+    int* valid = reinterpret_cast<int*>(alpha + HB);
+    const int t = blockIdx.y, h0 = blockIdx.x * HB, sp = blockIdx.z, NS = gridDim.z;
+    if (koff) {
+        const int64_t o = koff[t];
+        cq += o * kLat;
+        cs += o * 4;
+    }
+    const int nh = min(HB, H - h0);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, qd = lane & 3;
+    const int bnd = bound[t];
+    const int kmax = idx && !ascending ? K : min(K, bnd + 1);
+    const int k_lo = sp * chunk, k_hi = min(kmax, k_lo + chunk);
+
+    for (int i = tid; i < HB * (kLat / 8); i += blockDim.x) {
+        const int hh = i / (kLat / 8), c = i % (kLat / 8);
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (hh < nh) {
+            const int h = h0 + hh;
+            v = reinterpret_cast<const uint4*>(q + (int64_t)(h / hg) * q_ldg + (int64_t)t * q_ldt + (int64_t)(h % hg) * q_ldh)[c];
+        }
+        *reinterpret_cast<uint4*>(Qs + hh * kMLD + c * 8) = v;
+    }
+    if (tid < HB) {
+        m_run[tid] = -1e30f;
+        l_run[tid] = 0.f;
+    }
+    float acc[MT][8][4];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mt][nt][i] = 0.f;
+
+    constexpr int kPieces = NT * kNP / 256;   // 4: a thread's 16-byte pieces of a tile
+    uint4 pre_raw[kPieces];
+    float pre_s[kPieces];
+    bool pre_ok[kPieces];
+    int pre_key[kPieces];
+    auto keyld = [&](int n0, int (&kk)[kPieces]) {
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int n = n0 + (tid + 256 * u) / kNP;
+            kk[u] = n < k_hi ? (idx ? idx[(int64_t)t * ld_idx + n] : n) : -1;
+        }
+    };
+    auto prefetch_k = [&](const int (&kk)[kPieces]) {
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int c = (tid + 256 * u) % kNP;
+            const int key = kk[u];
+            const bool ok = key >= 0 && key <= bnd;
+            pre_ok[u] = ok;
+            pre_raw[u] = make_uint4(0, 0, 0, 0);
+            pre_s[u] = 0.f;
+            if (ok) {
+                const int64_t kr = key_row(key, split_n);
+                pre_raw[u] = *reinterpret_cast<const uint4*>(cq + kr * kLat + c * 16);
+                pre_s[u] = rbf(cs[kr * 4 + c / 8]);
+            }
+        }
+    };
+    if (k_lo < k_hi) {
+        int kk0[kPieces];
+        keyld(k_lo, kk0);
+        prefetch_k(kk0);
+    }
+    keyld(k_lo + NT, pre_key);
+    // this warp's score jobs: 8 keys (kb) of two 16-head m tiles; its PV columns: warp * 64 .. + 64
+    const int kb = warp & 3, mt0 = (warp >> 2) * 2;
+    const __nv_bfloat16* qa_l0 = Qs + (mt0 * 16 + (lane & 15)) * kMLD + (lane >> 4) * 8;
+    const __nv_bfloat16* qa_l1 = qa_l0 + 16 * kMLD;
+    for (int n0 = k_lo; n0 < k_hi; n0 += NT) {
+        __syncthreads();  // the previous tile's PV is done with K8 / Ps
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int i = tid + 256 * u, j = i / kNP, c = i % kNP;
+            // bytes 2qd, 2qd+1, 2qd+8, 2qd+9 of the piece -> the chunk's slot qd * 8 + (c & 1) * 4
+            const uint4 w = pre_raw[u];
+            const uint32_t q0 = __byte_perm(w.x, w.z, 0x5410), q1 = __byte_perm(w.x, w.z, 0x7632);
+            const uint32_t q2 = __byte_perm(w.y, w.w, 0x5410), q3 = __byte_perm(w.y, w.w, 0x7632);
+            unsigned char* dst = K8 + j * kF8RS + (c >> 1) * 32 + (c & 1) * 4;
+            *reinterpret_cast<uint32_t*>(dst) = q0;
+            *reinterpret_cast<uint32_t*>(dst + 8) = q1;
+            *reinterpret_cast<uint32_t*>(dst + 16) = q2;
+            *reinterpret_cast<uint32_t*>(dst + 24) = q3;
+            if ((c & 7) == 0) Sk[j * 4 + c / 8] = pre_s[u];
+            if (c == 0) valid[j] = pre_ok[u];
+        }
+        __syncthreads();
+        if (n0 + NT < k_hi) {
+            prefetch_k(pre_key);
+            keyld(n0 + 2 * NT, pre_key);
+        }
+        // scores
+        {
+            float c4[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+            const int key = kb * 8 + r;
+            const unsigned char* kr8 = K8 + key * kF8RS + qd * 8;
+#pragma unroll 4
+            for (int ks = 0; ks < kLat / 32; ++ks) {
+                const int d0 = ks * 32;
+                const uint2 b8 = *reinterpret_cast<const uint2*>(kr8 + ks * 32);
+                const float s = Sk[key * 4 + (ks >> 2)];
+                const uint32_t bb0 = f8pair_bf16(b8.x & 0xff, (b8.x >> 8) & 0xff, s, s);
+                const uint32_t bb1 = f8pair_bf16((b8.x >> 16) & 0xff, b8.x >> 24, s, s);
+                const uint32_t bb2 = f8pair_bf16(b8.y & 0xff, (b8.y >> 8) & 0xff, s, s);
+                const uint32_t bb3 = f8pair_bf16((b8.y >> 16) & 0xff, b8.y >> 24, s, s);
+                uint32_t aa[4];
+                ldsm_x4(aa, qa_l0 + d0);
+                mma_bf16(c4[0], aa[0], aa[1], aa[2], aa[3], bb0, bb1);
+                ldsm_x4(aa, qa_l0 + d0 + 16);
+                mma_bf16(c4[0], aa[0], aa[1], aa[2], aa[3], bb2, bb3);
+                ldsm_x4(aa, qa_l1 + d0);
+                mma_bf16(c4[1], aa[0], aa[1], aa[2], aa[3], bb0, bb1);
+                ldsm_x4(aa, qa_l1 + d0 + 16);
+                mma_bf16(c4[1], aa[0], aa[1], aa[2], aa[3], bb2, bb3);
+            }
+            const int k0 = kb * 8 + 2 * qd;
+#pragma unroll
+            for (int m = 0; m < 2; ++m) {
+                float* pr = Ps + ((mt0 + m) * 16) * kMPS;
+                pr[r * kMPS + k0] = valid[k0] ? c4[m][0] * scale : -INFINITY;
+                pr[r * kMPS + k0 + 1] = valid[k0 + 1] ? c4[m][1] * scale : -INFINITY;
+                pr[(r + 8) * kMPS + k0] = valid[k0] ? c4[m][2] * scale : -INFINITY;
+                pr[(r + 8) * kMPS + k0 + 1] = valid[k0 + 1] ? c4[m][3] * scale : -INFINITY;
+            }
+        }
+        __syncthreads();
+        // online softmax: a warp takes 8 heads, a lane one key (mla_kernel's per-head arithmetic)
+        {
+            constexpr int NU = 2 * MT;
+            float mo[NU], s0[NU], mn[NU], e0[NU], ls[NU];
+#pragma unroll
+            for (int u = 0; u < NU; ++u) {
+                const int hh = warp * NU + u;
+                mo[u] = m_run[hh];
+                s0[u] = Ps[hh * kMPS + lane];
+                mn[u] = s0[u];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int u = 0; u < NU; ++u) mn[u] = fmaxf(mn[u], __shfl_xor_sync(0xffffffffu, mn[u], o));
+#pragma unroll
+            for (int u = 0; u < NU; ++u) {
+                mn[u] = fmaxf(fmaxf(mo[u], mn[u]), -1e30f);
+                e0[u] = expf(s0[u] - mn[u]);
+                ls[u] = e0[u];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int u = 0; u < NU; ++u) ls[u] += __shfl_xor_sync(0xffffffffu, ls[u], o);
+#pragma unroll
+            for (int u = 0; u < NU; ++u) {
+                const int hh = warp * NU + u;
+                Ps[hh * kMPS + lane] = e0[u];
+                if (lane == 0) {
+                    const float al = expf(mo[u] - mn[u]);
+                    alpha[hh] = al;
+                    l_run[hh] = l_run[hh] * al + ls[u];
+                    m_run[hh] = mn[u];
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+            const float al0 = alpha[mt * 16 + r], al1 = alpha[mt * 16 + r + 8];
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                acc[mt][nt][0] *= al0;
+                acc[mt][nt][1] *= al0;
+                acc[mt][nt][2] *= al1;
+                acc[mt][nt][3] *= al1;
+            }
+        }
+        // PV: warp w takes latent dims w * 64 .. + 64 (chunks 2w, 2w + 1; one 128-block scale)
+#pragma unroll
+        for (int ks = 0; ks < NT / 16; ++ks) {
+            const int k0 = ks * 16;
+            uint32_t ah[MT][4];
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const float* pr0 = Ps + (mt * 16 + r) * kMPS + k0 + 2 * qd;
+                const float* pr1 = Ps + (mt * 16 + r + 8) * kMPS + k0 + 2 * qd;
+                ah[mt][0] = pack_bf16(pr0[0], pr0[1]);
+                ah[mt][1] = pack_bf16(pr1[0], pr1[1]);
+                ah[mt][2] = pack_bf16(pr0[8], pr0[9]);
+                ah[mt][3] = pack_bf16(pr1[8], pr1[9]);
+            }
+            // this lane's keys k0 + 2qd, +1, +8, +9; its column in each n8 block: r
+            const int kq[4] = {k0 + 2 * qd, k0 + 2 * qd + 1, k0 + 2 * qd + 8, k0 + 2 * qd + 9};
+            float sv[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) sv[i] = Sk[kq[i] * 4 + (warp >> 1)];
+            const int sh = 8 * (r & 1);
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                // chunk 2w + half: n8 blocks nt = 4 half .. + 3, byte (r >> 1) * 8 + (nt & 3) * 2 + (r & 1)
+                uint2 v8[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    v8[i] = *reinterpret_cast<const uint2*>(K8 + kq[i] * kF8RS + (warp * 2 + half) * 32 + (r >> 1) * 8);
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    const int nt = half * 4 + g;
+                    uint32_t x[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const uint32_t word = g < 2 ? v8[i].x : v8[i].y;
+                        x[i] = (word >> ((g & 1) * 16 + sh)) & 0xff;
+                    }
+                    const uint32_t b0 = f8pair_bf16(x[0], x[1], sv[0], sv[1]);
+                    const uint32_t b1 = f8pair_bf16(x[2], x[3], sv[2], sv[3]);
+#pragma unroll
+                    for (int mt = 0; mt < MT; ++mt) mma_bf16(acc[mt][nt], ah[mt][0], ah[mt][1], ah[mt][2], ah[mt][3], b0, b1);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (out) {
+        if (tid < HB) alpha[tid] = 1.f / fmaxf(l_run[tid], 1e-30f);
+        __syncthreads();
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const int d = warp * 64 + nt * 8 + 2 * qd;
+                const int ha = mt * 16 + r, hb = ha + 8;
+                if (ha < nh) {
+                    __nv_bfloat16* o = out + (int64_t)t * o_ldt + (int64_t)(h0 + ha) * o_ldh + d;
+                    *reinterpret_cast<uint32_t*>(o) = pack_bf16(acc[mt][nt][0] * alpha[ha], acc[mt][nt][1] * alpha[ha]);
+                }
+                if (hb < nh) {
+                    __nv_bfloat16* o = out + (int64_t)t * o_ldt + (int64_t)(h0 + hb) * o_ldh + d;
+                    *reinterpret_cast<uint32_t*>(o) = pack_bf16(acc[mt][nt][2] * alpha[hb], acc[mt][nt][3] * alpha[hb]);
+                }
+            }
+        return;
+    }
+    if (tid < nh) {
+        const int64_t b = ((int64_t)t * H + h0 + tid) * NS + sp;
+        part_m[b] = m_run[tid];
+        part_l[b] = l_run[tid];
+    }
+    const bool halfp = c_mla_half != 0;
+    if (halfp) {
         if (tid < HB) alpha[tid] = l_run[tid] > 0.f ? 1.f / l_run[tid] : 0.f;
         __syncthreads();
     }
@@ -1978,15 +2289,28 @@ static int mla_launch(void* stream, int mt, const void* q, int64_t q_ldg, int64_
     if (mt != 1 && mt != 2) return (int)cudaErrorInvalidValue;
     if (koff && split_n) return (int)cudaErrorInvalidValue;
     if (chunk % kMNT) return (int)cudaErrorInvalidValue;
-    // mla-fp8k (TIDELM_MLA_FP8K=1, GLM-5.3-Flash's RP 0 only): one block a row's 64 heads (MT 4), so each
-    // FP8 key is widened once a row, not once a 32-head block; 16-key tiles fit it in shared memory.
-    // Opt-in: the online softmax rescales every 16 keys instead of 32 (not the default's bits).
-    const bool fp8k = RP == 0 && mt == 2 && T >= 64 && mla_fp8k() && chunk % 16 == 0;
-    const int hb = fp8k ? 64 : 16 * mt;
+    // mla-fp8k (TIDELM_MLA_FP8K=1; GLM-5.3-Flash's RP 0, the 32-head path, 64 heads, 64+ rows): mla_f8_kernel
+    if constexpr (RP == 0) {
+        if (mt == 2 && H == 64 && T >= 64 && mla_fp8k()) {
+            static bool set8 = false;
+            constexpr int smem = mla_f8_smem();
+            if (!set8) {
+                cudaFuncSetAttribute(mla_f8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                set8 = true;
+            }
+            pdl_launch(mla_f8_kernel, dim3(1u, (unsigned)T, (unsigned)nsplit), 256, smem, GST, static_cast<const __nv_bfloat16*>(q),
+                       q_ldg, q_ldt, q_ldh, hg, static_cast<const uint8_t*>(cq), static_cast<const float*>(cs), split_n,
+                       static_cast<const int*>(idx), ld_idx, K, ascending, static_cast<const int*>(bound), H, scale, chunk,
+                       static_cast<float*>(part_m), static_cast<float*>(part_l), static_cast<float*>(part_acc),
+                       static_cast<__nv_bfloat16*>(out), o_ldt, o_ldh, static_cast<const int*>(koff));
+            GRET;
+        }
+    }
+    const int hb = 16 * mt;
     dim3 grid((unsigned)((H + hb - 1) / hb), (unsigned)T, (unsigned)nsplit);
     auto args = [&](auto kernel, int smem) {
-        static bool set1 = false, set2 = false, set4 = false;
-        bool& set = fp8k ? set4 : mt == 2 ? set2 : set1;
+        static bool set1 = false, set2 = false;
+        bool& set = mt == 2 ? set2 : set1;
         if (!set) {
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             set = true;
@@ -1999,12 +2323,6 @@ static int mla_launch(void* stream, int mt, const void* q, int64_t q_ldg, int64_
                                          static_cast<float*>(part_acc), static_cast<__nv_bfloat16*>(out), o_ldt, o_ldh,
                                          static_cast<const int*>(koff));
     };
-    if constexpr (RP == 0) {
-        if (fp8k) {
-            args(mla_kernel<4, 0, 16>, mla_smem<4, 0, 16>());
-            GRET;
-        }
-    }
     if (mt == 2) args(mla_kernel<2, RP>, mla_smem<2, RP>());
     else args(mla_kernel<1, RP>, mla_smem<1, RP>());
     GRET;

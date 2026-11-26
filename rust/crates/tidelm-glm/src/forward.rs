@@ -1465,10 +1465,12 @@ impl Engine {
             ck(unsafe { ds_splits_reduce(self.st.raw(), part, splits as i32, n as i32, e as i32, std::ptr::null_mut(),
                                          np(&a.logits), e as i64) }, "router reduce")?;
         }
-        ck(unsafe { glm_router_e(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
+        // expert-skip: the exact picks drop the same low-weight experts (no hot read for a skipped one)
+        let skip = expert_skip(l == cfg.mtp_layer() && cfg.mtp, decode);
+        ck(unsafe { glm_router_skip(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
                                  cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, hot, std::ptr::null(),
                                  std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(),
-                                 std::ptr::null_mut(), 0, std::ptr::null(), e as i32) }, "router (exact)")
+                                 std::ptr::null_mut(), 0, std::ptr::null(), e as i32, skip, std::ptr::null_mut()) }, "router (exact)")
     }
 
     /// Join the shared gate/up moe_exact left running, if it did.
@@ -1509,12 +1511,16 @@ impl Engine {
         let (e, h) = (cfg.experts, cfg.hidden);
         let mtp = cfg.mtp && l == cfg.mtp_layer();
         let (lut, arena) = if mtp { (np(&self.mtp_lut), self.mtp_arena.as_ref().unwrap()) } else { (at(&self.lut, l * e), &self.arena) };
-        ck(unsafe { glm_router_e(self.st.raw(), np(&a.logits), np(bias), self.allowed_ptr(l), lut, n as i32, cfg.topk as i32,
+        // expert-skip (opt-in): decode rows (n x topk <= 64, as moe_rows) and prefill rows each their own cutoff
+        let decode = n * cfg.topk <= 64;
+        let skip = expert_skip(mtp, decode);
+        let sacc = if skip > 0.0 { skip_counters(decode) } else { std::ptr::null_mut() };
+        ck(unsafe { glm_router_skip(self.st.raw(), np(&a.logits), np(bias), self.allowed_ptr(l), lut, n as i32, cfg.topk as i32,
                                  cfg.routed_scaling, np(&a.pick), np(&a.wts), std::ptr::null(), std::ptr::null_mut(), np(&a.eids),
                                  np(&a.ew), at(&self.demand, l * e), np(&self.miss), std::ptr::null(),
                                  if mtp { std::ptr::null_mut() } else { np(&self.lane_miss) },
                                  if mtp { std::ptr::null_mut() } else { at(&self.lane_demand, l * e) },
-                                 (self.cfg.n_layers() * e) as i64, at(&a.rlane, r0), e as i32) }, "router")?;
+                                 (self.cfg.n_layers() * e) as i64, at(&a.rlane, r0), e as i32, skip, sacc) }, "router")?;
         // the decoder's next layer, whose first weights load while this one's output is gathered
         let next = if mtp || l + 1 >= cfg.layers { None } else { Some(&self.w.layers[l + 1]) };
         self.moe_rows(moe.shared, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h), next)?;
@@ -3286,6 +3292,50 @@ impl Engine {
             }
         }
     }
+}
+
+/// expert-skip (opt-in): the cutoff on a pick's normalized router weight (w / sum of the row's top-k)
+/// under which it is dropped and the rest renormalized - TIDELM_EXPERT_SKIP_DECODE for decode rows
+/// (n x topk <= 64: verify and plain decode passes), TIDELM_EXPERT_SKIP_PREFILL for prefill chunks;
+/// unset or 0: off (the router's bits). The MTP layer (drafts only) never skips. The top pick always stays.
+pub(crate) fn expert_skip(mtp: bool, decode: bool) -> f32 {
+    static V: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    let (d, p) = *V.get_or_init(|| {
+        let r = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).filter(|v| *v > 0.0 && *v < 1.0).unwrap_or(0.0);
+        let v = (r("TIDELM_EXPERT_SKIP_DECODE"), r("TIDELM_EXPERT_SKIP_PREFILL"));
+        if v.0 > 0.0 || v.1 > 0.0 {
+            eprintln!("expert-skip: decode cutoff {}, prefill cutoff {} (normalized router weight; 0 = off)", v.0, v.1);
+        }
+        v
+    });
+    if mtp { 0.0 } else if decode { d } else { p }
+}
+
+/// expert-skip's counters (mapped pinned u64: decode valid / kept, prefill valid / kept): the device
+/// pointer of the pair for decode or prefill rows
+fn skip_counters(decode: bool) -> *mut c_void {
+    let (d, _) = skip_counter_ptrs();
+    if d.is_null() { return d; }
+    unsafe { (d as *mut u64).add(if decode { 0 } else { 2 }) as *mut c_void }
+}
+
+fn skip_counter_ptrs() -> (*mut c_void, *mut c_void) {
+    static P: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (d, h) = *P.get_or_init(|| {
+        let (mut d, mut h) = (std::ptr::null_mut(), std::ptr::null_mut());
+        if unsafe { glm_skip_counters(&mut d, &mut h) } != 0 { return (0, 0); }
+        (d as usize, h as usize)
+    });
+    (d as *mut c_void, h as *mut c_void)
+}
+
+/// expert-skip's counters so far: (decode valid, kept, prefill valid, kept) picks; zeros when off
+pub fn expert_skip_counts() -> [u64; 4] {
+    if expert_skip(false, true) == 0.0 && expert_skip(false, false) == 0.0 { return [0; 4]; }
+    let (_, h) = skip_counter_ptrs();
+    if h.is_null() { return [0; 4]; }
+    let p = h as *const u64;
+    unsafe { [0, 1, 2, 3].map(|i| std::ptr::read_volatile(p.add(i))) }
 }
 
 /// prefill-27k: the routed expert kernels' grid over the blocks one layer can fill (default on)

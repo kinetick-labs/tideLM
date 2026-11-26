@@ -999,9 +999,24 @@ impl Server {
         } else {
             String::new()
         };
+        // expert-skip (opt-in): experts kept a routed row since the last request line (both lanes')
+        let skipped = {
+            static LAST: std::sync::Mutex<[u64; 4]> = std::sync::Mutex::new([0; 4]);
+            let now = crate::forward::expert_skip_counts();
+            let mut last = LAST.lock().unwrap();
+            let d: Vec<u64> = (0..4).map(|i| now[i].saturating_sub(last[i])).collect();
+            *last = now;
+            let k = self.eng.cfg.topk as f64;
+            let avg = |v: u64, kept: u64| if v > 0 { format!("{:.2}", kept as f64 / v as f64 * k) } else { "-".into() };
+            if now.iter().any(|&x| x > 0) {
+                format!(", experts kept a row: decode {} / prefill {} of {}", avg(d[0], d[1]), avg(d[2], d[3]), k)
+            } else {
+                String::new()
+            }
+        };
         let line = format!("request {}, {}: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
                             miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {} inline, {:.2} s waited), \
-                            swaps {} ({:.2} s waited), preload {} ({} MB, {:.2} s), fallbacks {}{nan}{beside}{listed}",
+                            swaps {} ({:.2} s waited), preload {} ({} MB, {:.2} s), fallbacks {}{nan}{beside}{listed}{skipped}",
                            run.job.id, self.eng.cfg.arch.name(), s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
                            s.copy_accepted, pct(p[0] + d[0], p[1] + d[1]), pct(p[0], p[1]), pct(d[0], d[1]),
                            pct(p[2] + d[2], p[3] + d[3]), r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept,

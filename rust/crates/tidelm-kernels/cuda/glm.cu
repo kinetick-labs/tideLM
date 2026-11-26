@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <string.h>
 #include <utility>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -1658,7 +1659,8 @@ __global__ void __launch_bounds__(E) router_kernel(const float* __restrict__ log
                                                     float* __restrict__ demand, double* __restrict__ acc,
                                                     const int* __restrict__ live, double* __restrict__ lane_acc,
                                                     float* __restrict__ lane_demand, int64_t lane_stride,
-                                                    const int* __restrict__ row_lane) {
+                                                    const int* __restrict__ row_lane, float skip,
+                                                    unsigned long long* __restrict__ skip_acc) {
     pdl_enter();
     __shared__ float sc[E];
     const int t = blockIdx.x;
@@ -1669,9 +1671,28 @@ __global__ void __launch_bounds__(E) router_kernel(const float* __restrict__ log
     if (threadIdx.x != 0) return;
     float tot = 0.f;
     for (int k = 0; k < K; ++k) tot += cs[k];
+    // expert-skip (opt-in, skip > 0): a pick whose normalized weight cs / tot is under `skip` is dropped
+    // (a -1 pick, weight 0: the EXL3 kernels skip it) and the kept picks renormalized over their own
+    // sum. skip = 0 keeps every pick and the weights' bits (tot unchanged, same expression).
+    unsigned drop = 0u;
+    float wtot = tot;
+    if (skip > 0.f) {
+        wtot = 0.f;
+        int kept = 0, valid = 0;
+        for (int k = 0; k < K; ++k) {
+            if (chosen[k] < 0) continue;
+            ++valid;
+            if (k > 0 && cs[k] < skip * tot) drop |= 1u << k;
+            else { wtot += cs[k]; ++kept; }
+        }
+        if (skip_acc && !(live && t >= live[0])) {
+            atomicAdd(&skip_acc[0], (unsigned long long)valid);
+            atomicAdd(&skip_acc[1], (unsigned long long)kept);
+        }
+    }
     for (int k = 0; k < K; ++k) {
-        const int ex = chosen[k];
-        float wt = cs[k] / (tot + 1e-20f) * scale;
+        const int ex = (drop >> k) & 1u ? -1 : chosen[k];
+        float wt = ex >= 0 ? cs[k] / (wtot + 1e-20f) * scale : 0.f;
         int out = ex;
         if (lut) {
             out = ex >= 0 ? lut[ex] : -1;
@@ -1682,7 +1703,7 @@ __global__ void __launch_bounds__(E) router_kernel(const float* __restrict__ log
         if (hot) {
             const bool miss = ex >= 0 && resident && !resident[ex];
             hot[(t * K + k) * 2] = miss ? wt / scale : -(wt / scale);
-            hot[(t * K + k) * 2 + 1] = (float)ex;
+            hot[(t * K + k) * 2 + 1] = (float)chosen[k];   // a skipped pick: its expert, share -0 (no candidate)
         }
     }
     if (live && t >= live[0]) return;
@@ -2372,6 +2393,8 @@ int glm_router(void* stream, const void* logits, const void* bias, const void* a
                void* demand, void* acc, const void* live, void* lane_acc, void* lane_demand, int64_t lane_stride,
                const void* row_lane) {
     if (K > 8) return (int)cudaErrorInvalidValue;
+    const float skip = 0.f;
+    void* skip_acc = nullptr;
     pdl_launch(router_kernel<kE>, T, kE, 0, GST, static_cast<const float*>(logits), static_cast<const float*>(bias),
                                      static_cast<const uint8_t*>(allowed), static_cast<const int*>(lut), K, scale,
                                      static_cast<int*>(ids), static_cast<float*>(w), static_cast<const uint8_t*>(resident),
@@ -2379,15 +2402,17 @@ int glm_router(void* stream, const void* logits, const void* bias, const void* a
                                      static_cast<const float*>(ex_w), static_cast<float*>(demand),
                                      static_cast<double*>(acc), static_cast<const int*>(live),
                                      static_cast<double*>(lane_acc), static_cast<float*>(lane_demand), lane_stride,
-                                     static_cast<const int*>(row_lane));
+                                     static_cast<const int*>(row_lane), skip, static_cast<unsigned long long*>(skip_acc));
     GRET;
 }
 
 // the router over E experts (GLM-5.3 256, GLM-5.3-Flash 288: a thread an expert)
-int glm_router_e(void* stream, const void* logits, const void* bias, const void* allowed, const void* lut, int T, int K,
+// expert-skip: glm_router_e with a cutoff on the picks' normalized weights (skip 0: glm_router_e's bits)
+// and its counters (skip_acc[0] += valid picks, [1] += kept; null: none)
+int glm_router_skip(void* stream, const void* logits, const void* bias, const void* allowed, const void* lut, int T, int K,
                float scale, void* ids, void* w, const void* resident, void* hot, const void* ex_ids, const void* ex_w,
                void* demand, void* acc, const void* live, void* lane_acc, void* lane_demand, int64_t lane_stride,
-               const void* row_lane, int E) {
+               const void* row_lane, int E, float skip, void* skip_acc) {
     if (K > 8) return (int)cudaErrorInvalidValue;
     auto go = [&](auto kernel, int e) {
     pdl_launch(kernel, T, e, 0, GST, static_cast<const float*>(logits), static_cast<const float*>(bias),
@@ -2397,13 +2422,38 @@ int glm_router_e(void* stream, const void* logits, const void* bias, const void*
                                      static_cast<const float*>(ex_w), static_cast<float*>(demand),
                                      static_cast<double*>(acc), static_cast<const int*>(live),
                                      static_cast<double*>(lane_acc), static_cast<float*>(lane_demand), lane_stride,
-                                     static_cast<const int*>(row_lane));
+                                     static_cast<const int*>(row_lane), skip, static_cast<unsigned long long*>(skip_acc));
     };
     if (E == 256) go(router_kernel<256>, 256);
     else if (E == 288) go(router_kernel<288>, 288);
     else if (E == 384) go(router_kernel<384>, 384);   // Inkling 2
     else return (int)cudaErrorInvalidValue;
     GRET;
+}
+
+int glm_router_e(void* stream, const void* logits, const void* bias, const void* allowed, const void* lut, int T, int K,
+               float scale, void* ids, void* w, const void* resident, void* hot, const void* ex_ids, const void* ex_w,
+               void* demand, void* acc, const void* live, void* lane_acc, void* lane_demand, int64_t lane_stride,
+               const void* row_lane, int E) {
+    return glm_router_skip(stream, logits, bias, allowed, lut, T, K, scale, ids, w, resident, hot, ex_ids, ex_w, demand, acc,
+                           live, lane_acc, lane_demand, lane_stride, row_lane, E, 0.f, nullptr);
+}
+
+// expert-skip's counters: 4 u64 in mapped pinned memory (decode valid, kept; prefill valid, kept), the
+// device pointer for the kernels and the host one for the request log; allocated on the first call
+int glm_skip_counters(void** dev, void** host) {
+    static void* h = nullptr;
+    static void* d = nullptr;
+    if (!h) {
+        cudaError_t e = cudaHostAlloc(&h, 4 * sizeof(unsigned long long), cudaHostAllocMapped);
+        if (e != cudaSuccess) return (int)e;
+        memset(h, 0, 4 * sizeof(unsigned long long));
+        e = cudaHostGetDevicePointer(&d, h, 0);
+        if (e != cudaSuccess) return (int)e;
+    }
+    *dev = d;
+    *host = h;
+    return 0;
 }
 
 int glm_swiglu(void* stream, const void* g, int64_t ldg, const void* u, int64_t ldu, void* y, int64_t ldy, int T, int n) {

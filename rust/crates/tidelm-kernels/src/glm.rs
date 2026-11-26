@@ -4,6 +4,14 @@
 use crate::CudaStream;
 use std::os::raw::{c_int, c_void};
 
+#[link(name = "cublasLt")]
+extern "C" {
+    /// prefill-pg: y[m][n] f32 = x[m][k] f16 . W[k][n] f16 through a per-shape pick (cublasLt where it is faster
+    /// and bit-identical); 1: the caller runs cublasGemmEx itself
+    pub fn glm_gemm_f16f32_tuned(handle: *mut c_void, m: c_int, n: c_int, k: c_int, x: *const c_void, ldx: c_int,
+                                 w: *const c_void, ldw: c_int, y: *mut c_void, ldy: c_int) -> c_int;
+}
+
 extern "C" {
     pub fn glm_embed(stream: CudaStream, ids: *const c_void, t: c_int, q: *const c_void, sc: *const c_void, lo: c_int,
                      vl: c_int, h: c_int, pos: *const c_void, out: *mut c_void) -> c_int;
@@ -13,6 +21,8 @@ extern "C" {
                        world: c_int, esz: c_int) -> c_int;
     pub fn glm_rmsnorm(stream: CudaStream, h: *mut c_void, ldh: i64, a: *const c_void, lda: i64, w: *const c_void,
                        y: *mut c_void, ldy: i64, t: c_int, n: c_int, eps: f32) -> c_int;
+    pub fn glm_hc_pre_rms(stream: CudaStream, h: *const c_void, pre: *const c_void, hy: *mut c_void, w: *const c_void,
+                          y: *mut c_void, ldy: i64, t: c_int, n: c_int, eps: f32) -> c_int;
     pub fn glm_rope(stream: CudaStream, x: *const c_void, xt: i64, xh: i64, y: *mut c_void, yt: i64, yh: i64, t: c_int,
                     h: c_int, cos: *const c_void, sin: *const c_void, pos: *const c_void) -> c_int;
     pub fn glm_kv_fp8(stream: CudaStream, x: *const c_void, ldx: i64, rows: *const c_void, q: *mut c_void, s: *mut c_void,

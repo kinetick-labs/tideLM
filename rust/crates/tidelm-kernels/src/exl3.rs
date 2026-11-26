@@ -98,6 +98,16 @@ extern "C" {
                                     members: *const c_void, k: c_int, n: c_int, p: c_int, slots: c_int, nblocks: c_int,
                                     cb: c_int, hi: c_int, svh_g: *const c_void, svh_u: *const c_void, suh_d: *const c_void,
                                     suh_d_stride: c_int, limit: f32, xd: *mut c_void, s: CudaStream);
+    /// prefill-pg's FP8 gate/up (TIDELM_FP8_GU): rot_in's rows as e4m3 (row scales after them, at byte p * k)
+    pub fn exl3m_rot_in8(x: *const c_void, x_stride: c_int, pick: *const c_void, suh0: *const c_void, suh1: *const c_void,
+                         out0: *mut c_void, out1: *mut c_void, rows: c_int, k: c_int, slots: c_int, x_bf16: c_int,
+                         s: CudaStream);
+    /// exl3m_prefill_fat_gateup over exl3m_rot_in8's e4m3 rows (m16n8k32 e4m3 MMA): not bit-exact
+    pub fn exl3m_prefill_fat_gateup8(x0: *const c_void, x1: *const c_void, tp0: *const c_void, tp1: *const c_void,
+                                     k2_0: *const c_void, k2_1: *const c_void, uids: *const c_void, ucount: *const c_void,
+                                     members: *const c_void, k: c_int, n: c_int, p: c_int, slots: c_int, nblocks: c_int,
+                                     cb: c_int, hi: c_int, svh_g: *const c_void, svh_u: *const c_void, suh_d: *const c_void,
+                                     suh_d_stride: c_int, limit: f32, xd: *mut c_void, s: CudaStream);
     pub fn exl3m_gateup(z: *const c_void, pick: *const c_void, svh_g: *const c_void, svh_u: *const c_void,
                         suh_d: *const c_void, xd: *mut c_void, rows: c_int, p: c_int, n: c_int, sk: c_int,
                         slots: c_int, e: c_int, suh_d_stride: c_int, limit: f32, act_mode: c_int, s: CudaStream);
@@ -105,6 +115,9 @@ extern "C" {
                            k: c_int, g: c_int, x_bf16: c_int, s: CudaStream);
     pub fn exl3m_dense_out(z: *const c_void, svh: *const c_void, out: *mut c_void, rows: c_int, n: c_int, sk: c_int,
                            g: c_int, out_bf16: c_int, out_stride: c_int, s: CudaStream);
+    pub fn exl3m_down_combine_bf(z: *const c_void, pick: *const c_void, svh_d: *const c_void, wts: *const c_void,
+                                 sh: *const c_void, y: *mut c_void, rows: c_int, p: c_int, d: c_int, sk: c_int, slots: c_int,
+                                 e: c_int, s: CudaStream);
     pub fn exl3m_down_combine(z: *const c_void, pick: *const c_void, svh_d: *const c_void, wts: *const c_void,
                               out: *mut c_void, rows: c_int, p: c_int, d: c_int, sk: c_int, slots: c_int, e: c_int,
                               s: CudaStream);

@@ -13,6 +13,13 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <utility>
+#include <cublas_v2.h>
+#include <cublasLt.h>
+#include <map>
+#include <mutex>
+#include <tuple>
+#include <cstdlib>
+#include <cstdio>
 
 // Programmatic dependent launch, as ds41.cu's: every kernel here (but the L2 prefetch, launched on
 // its own branch) starts with pdl_enter(), and once the GLM engine switches it on (glm_set_pdl;
@@ -256,6 +263,44 @@ __global__ void __launch_bounds__(1024) rmsnorm_kernel(__nv_bfloat16* __restrict
 #pragma unroll
     for (int i = 0; i < kPer; ++i) {
         const int c = threadIdx.x + i * blockDim.x;
+        if (c < N) yr[c] = to_bf(bf(w[c]) * rbf(v[i] * r));
+    }
+}
+
+// ds41's hc_pre_norm_v8_kernel (no weight: the streams weighted by pre, one bf16 rounding) then
+// rmsnorm_kernel<false> on its row, in one launch (prefill-pg): 1024 threads a row, column c =
+// threadIdx.x + i * 1024 as rmsnorm_kernel walks it; each value's arithmetic and the sum's order are
+// the two kernels', so hy and y keep their bits. hc = 4, N <= 4096.
+__global__ void __launch_bounds__(1024) hc_pre_rms_kernel(const __nv_bfloat16* __restrict__ h, const float* __restrict__ pre,
+                                                          __nv_bfloat16* __restrict__ hy, const __nv_bfloat16* __restrict__ w,
+                                                          __nv_bfloat16* __restrict__ y, int64_t ldy, int N, float eps) {
+    pdl_enter();
+    constexpr int HC = 4, kPer = 12;
+    __shared__ float red[32];
+    const int m = blockIdx.x;
+    const __nv_bfloat16* hr = h + (int64_t)m * HC * N;
+    const float* pm = pre + (int64_t)m * HC;
+    float v[kPer];
+    float ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int c = threadIdx.x + i * 1024;
+        v[i] = 0.f;
+        if (c < N) {
+            float acc = __fmul_rn(pm[0], bf(hr[c]));
+            for (int q = 1; q < HC; ++q) acc = fmaf(pm[q], bf(hr[(int64_t)q * N + c]), acc);
+            const __nv_bfloat16 vb = to_bf(acc);
+            hy[(int64_t)m * N + c] = vb;
+            v[i] = bf(vb);
+        }
+        ss += v[i] * v[i];
+    }
+    ss = block_sum(ss, red);
+    const float r = 1.f / sqrtf(ss / N + eps);
+    __nv_bfloat16* yr = y + (int64_t)m * ldy;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int c = threadIdx.x + i * 1024;
         if (c < N) yr[c] = to_bf(bf(w[c]) * rbf(v[i] * r));
     }
 }
@@ -915,13 +960,43 @@ __global__ void __launch_bounds__(256) mla_kernel(
     uint4 pre_raw[kPF][kPieces];
     float pre_s[kPF][kPieces];
     bool pre_ok[kPF][kPieces];
-    auto prefetch = [&](int n0, uint4 (&raw)[kPieces], float (&sc)[kPieces], bool (&okv)[kPieces]) {
+    // The picks are read a tile before their keys (prefill-pg): a tile's key loads no longer wait on
+    // its pick loads; same keys, same bits.
+    int pre_key[kPieces];
+    auto keyld = [&](int n0, int (&kk)[kPieces]) {
 #pragma unroll
         for (int u = 0; u < kPieces; ++u) {
-            const int i = tid + 256 * u, j = i / kNP, c = i % kNP;
-            const int n = n0 + j;
-            int key = -1;
-            if (n < k_hi) key = idx ? idx[(int64_t)t * ld_idx + n] : n;
+            const int n = n0 + (tid + 256 * u) / kNP;
+            kk[u] = n < k_hi ? (idx ? idx[(int64_t)t * ld_idx + n] : n) : -1;
+        }
+    };
+    auto prefetch = [&](int n0, uint4 (&raw)[kPieces], float (&sc)[kPieces], bool (&okv)[kPieces]) {
+        int kk[kPieces];
+        keyld(n0, kk);
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int i = tid + 256 * u, c = i % kNP;
+            const int key = kk[u];
+            const bool ok = key >= 0 && key <= bnd;
+            okv[u] = ok;
+            raw[u] = make_uint4(0, 0, 0, 0);
+            sc[u] = 0.f;
+            if (ok && !(c_mla_probe & 1)) {
+                const int64_t kr = key_row(key, split_n);
+                if (c < 32) {
+                    raw[u] = *reinterpret_cast<const uint4*>(cq + kr * kLat + c * 16);
+                    sc[u] = rbf(cs[kr * 4 + c / 8]);
+                } else {
+                    raw[u] = reinterpret_cast<const uint4*>(cr + kr * 64)[c - 32];
+                }
+            }
+        }
+    };
+    auto prefetch_k = [&](const int (&kk)[kPieces], uint4 (&raw)[kPieces], float (&sc)[kPieces], bool (&okv)[kPieces]) {
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int i = tid + 256 * u, c = i % kNP;
+            const int key = kk[u];
             const bool ok = key >= 0 && key <= bnd;
             okv[u] = ok;
             raw[u] = make_uint4(0, 0, 0, 0);
@@ -940,6 +1015,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
 #pragma unroll
     for (int sl = 0; sl < kPF; ++sl)
         if (k_lo + sl * kMNT < k_hi) prefetch(k_lo + sl * kMNT, pre_raw[sl], pre_s[sl], pre_ok[sl]);
+    keyld(k_lo + kPF * kMNT, pre_key);
     for (int nb = k_lo; nb < k_hi; nb += kPF * kMNT) {
 #pragma unroll
     for (int sl = 0; sl < kPF; ++sl) {
@@ -960,24 +1036,31 @@ __global__ void __launch_bounds__(256) mla_kernel(
             if (c == 0) valid[j] = pre_ok[sl][u];
         }
         __syncthreads();
-        if (n0 + kPF * kMNT < k_hi) prefetch(n0 + kPF * kMNT, pre_raw[sl], pre_s[sl], pre_ok[sl]);
+        if (n0 + kPF * kMNT < k_hi) {
+            prefetch_k(pre_key, pre_raw[sl], pre_s[sl], pre_ok[sl]);
+            keyld(n0 + 2 * kPF * kMNT, pre_key);
+        }
         // scores: (m tile, 8 keys) jobs over the warps
         for (int job = warp; job < MT * (kMNT / 8); job += 8) {
             const int mt = job / (kMNT / 8), kb = job % (kMNT / 8);
             float c4[4] = {0.f, 0.f, 0.f, 0.f};
             const __nv_bfloat16* kn = Ks + (kb * 8 + r) * kMLD;
             const __nv_bfloat16* qa = Qs + (mt * 16) * kMLD;
+            // the same fragments through ldmatrix (prefill-pg): A a 16x16 tile, B two k16 steps of 8 keys
+            static_assert(kMD % 32 == 0, "score loop: two k16 steps a round");
+            const __nv_bfloat16* qa_l = qa + (lane & 15) * kMLD + (lane >> 4) * 8;
+            const __nv_bfloat16* kb_l = Ks + (kb * 8 + (lane & 7)) * kMLD + (lane >> 3) * 8;
 #pragma unroll 4
-            for (int ks = 0; ks < ((c_mla_probe & 2) ? 0 : kMD / 16); ++ks) {
-                const int d0 = ks * 16;
-                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(qa + r * kMLD + d0 + 2 * qd);
-                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(qa + (r + 8) * kMLD + d0 + 2 * qd);
-                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(qa + r * kMLD + d0 + 8 + 2 * qd);
-                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(qa + (r + 8) * kMLD + d0 + 8 + 2 * qd);
-                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(kn + d0 + 2 * qd);
-                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(kn + d0 + 8 + 2 * qd);
-                mma_bf16(c4, a0, a1, a2, a3, b0, b1);
+            for (int ks = 0; ks < ((c_mla_probe & 2) ? 0 : kMD / 32); ++ks) {
+                const int d0 = ks * 32;
+                uint32_t bb[4], aa[4];
+                ldsm_x4(bb, kb_l + d0);
+                ldsm_x4(aa, qa_l + d0);
+                mma_bf16(c4, aa[0], aa[1], aa[2], aa[3], bb[0], bb[1]);
+                ldsm_x4(aa, qa_l + d0 + 16);
+                mma_bf16(c4, aa[0], aa[1], aa[2], aa[3], bb[2], bb[3]);
             }
+            (void)kn;
             const int k0 = kb * 8 + 2 * qd;
             float* pr = Ps + (mt * 16) * kMPS;
             pr[r * kMPS + k0] = valid[k0] ? c4[0] * scale : -INFINITY;
@@ -987,21 +1070,41 @@ __global__ void __launch_bounds__(256) mla_kernel(
         }
         __syncthreads();
         // online softmax: a warp takes 2 * MT heads, a lane one key
+        // the warp's 2 * MT heads side by side (prefill-pg): each head's arithmetic as before
+        {
+            constexpr int NU = 2 * MT;
+            float mo[NU], s0[NU], mn[NU], e0[NU], ls[NU];
 #pragma unroll
-        for (int u = 0; u < 2 * MT; ++u) {
-            const int hh = warp * 2 * MT + u;
-            const float mo = m_run[hh];
-            const float s0 = Ps[hh * kMPS + lane];
-            const float mn = fmaxf(fmaxf(mo, warp_max(s0)), -1e30f);
-            const float e0 = expf(s0 - mn);
-            const float ls = warp_sum(e0);
-            Ps[hh * kMPS + lane] = e0;
-            __syncwarp();
-            if (lane == 0) {
-                const float al = expf(mo - mn);
-                alpha[hh] = al;
-                l_run[hh] = l_run[hh] * al + ls;
-                m_run[hh] = mn;
+            for (int u = 0; u < NU; ++u) {
+                const int hh = warp * NU + u;
+                mo[u] = m_run[hh];
+                s0[u] = Ps[hh * kMPS + lane];
+                mn[u] = s0[u];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int u = 0; u < NU; ++u) mn[u] = fmaxf(mn[u], __shfl_xor_sync(0xffffffffu, mn[u], o));
+#pragma unroll
+            for (int u = 0; u < NU; ++u) {
+                mn[u] = fmaxf(fmaxf(mo[u], mn[u]), -1e30f);
+                e0[u] = expf(s0[u] - mn[u]);
+                ls[u] = e0[u];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int u = 0; u < NU; ++u) ls[u] += __shfl_xor_sync(0xffffffffu, ls[u], o);
+#pragma unroll
+            for (int u = 0; u < NU; ++u) {
+                const int hh = warp * NU + u;
+                Ps[hh * kMPS + lane] = e0[u];
+                if (lane == 0) {
+                    const float al = expf(mo[u] - mn[u]);
+                    alpha[hh] = al;
+                    l_run[hh] = l_run[hh] * al + ls[u];
+                    m_run[hh] = mn[u];
+                }
             }
         }
         __syncthreads();
@@ -1435,6 +1538,60 @@ __global__ void exl3_unpack_kernel(const uint32_t* __restrict__ tr, int NT, int 
     }
 }
 
+// exl3_unpack_kernel with the block's 8 trellis tiles staged in shared memory and a thread 8 columns
+// of one row (one 16-byte store) (prefill-pg): every value computed as there.
+__device__ __forceinline__ __half exl3_unpack_value(uint32_t state, int cb) {
+    if (cb >= 3) {
+        __half v;
+        if (cb <= 4) {
+            const uint32_t x = ((state * 0xCBAC1FEDu) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+            v = __hadd(__ushort_as_half((unsigned short)(x & 0xffffu)), __ushort_as_half((unsigned short)(x >> 16)));
+        } else {
+            const uint32_t x = state * 0x83DCD12Du;
+            const uint32_t h = 1024u + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
+            v = __float2half_rn((float)h * 0.00676727294921875f + -10.3828125f);
+        }
+        if (cb == 4 || cb == 6) return __ushort_as_half((unsigned short)((__half_as_ushort(v) + 0x40u) & 0xFF80u));
+        const __half cm = __hmax(__ushort_as_half((unsigned short)((__half_as_ushort(v) & 0x7C00u) + 0x1E00u)), __ushort_as_half(0x4200));
+        return __hsub(__hadd(v, cm), cm);
+    }
+    const uint32_t x = state * 0x83DCD12Du;
+    const uint32_t h = 1024u + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
+    const float v = (float)h * 0.00676727294921875f + -10.3828125f;
+    return __float2half_rn(v);
+}
+
+__global__ void __launch_bounds__(256) exl3_unpack8_kernel(const uint32_t* __restrict__ tr, int NT, int N, int bits, int cb,
+                                                           __half* __restrict__ W) {
+    pdl_enter();
+    __shared__ uint32_t sw[8 * 8 * 16];   // 8 tiles of 8 * bits words, bits <= 16
+    const int kt = blockIdx.x, c0 = blockIdx.y * 128;
+    const int nw = 8 * bits;
+    const uint32_t* src = tr + ((int64_t)kt * NT + c0 / 16) * nw;   // the block's 8 tiles are consecutive
+    for (int i = threadIdx.x; i < 8 * nw; i += blockDim.x) sw[i] = src[i];
+    __syncthreads();
+    const int r = threadIdx.x >> 4, cg = threadIdx.x & 15;
+    const int tl = cg >> 1, cb0 = (cg & 1) * 8;
+    const uint32_t* base = sw + tl * nw;
+    uint4 o;
+    __half* oe = reinterpret_cast<__half*>(&o);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int col = cb0 + e;
+        const int j = (r & 1) | (((r >> 3) & 1) << 1) | ((col >> 3) << 2);
+        const int lane = ((col & 7) << 2) | ((r >> 1) & 3);
+        const int p = lane * 8 + j;
+        const int first = (p + 1) * bits - 16 + 32 * nw;
+        const int i0 = (first / 32) % nw, i1 = (i0 + 1) % nw;
+        const uint32_t off = (uint32_t)(first % 32);
+        const uint32_t w0 = base[i0], w1 = base[i1];
+        const uint32_t hi = off >= 16 ? w0 << (off - 16) : w0 >> (16 - off);
+        const uint32_t lo = off > 16 ? w1 >> (48 - off) : 0u;
+        oe[e] = exl3_unpack_value((hi | lo) & 0xffffu, cb);
+    }
+    *reinterpret_cast<uint4*>(W + ((int64_t)kt * 16 + r) * N + c0 + cg * 8) = o;
+}
+
 // fp4_moe.build_routing's member codes for the EXL3 kernels: a block's pair p -> (p / K) * 32 +
 // p % K (row, pick), -1 kept; and the used blocks' count (block_slot >= 0 is a prefix).
 __global__ void member_codes_kernel(const int* __restrict__ pair, int n, int K, int* __restrict__ out) {
@@ -1646,6 +1803,15 @@ int glm_unshard(void* stream, const void* src, int64_t rank_stride, void* dst, i
     if (esz == 2) pdl_launch(unshard_kernel<uint16_t>, g, 256, 0, GST, static_cast<const uint16_t*>(src), rank_stride, static_cast<uint16_t*>(dst), M, n, world);
     else if (esz == 4) pdl_launch(unshard_kernel<uint32_t>, g, 256, 0, GST, static_cast<const uint32_t*>(src), rank_stride, static_cast<uint32_t*>(dst), M, n, world);
     else return (int)cudaErrorInvalidValue;
+    GRET;
+}
+
+// hc_pre_norm (hc 4, no weight) into hy, then glm_rmsnorm(hy -> y) in one launch; 1 = not this shape.
+int glm_hc_pre_rms(void* stream, const void* h, const void* pre, void* hy, const void* w, void* y, int64_t ldy, int T, int N,
+                   float eps) {
+    if (N < 4096 || N > 12 * 1024) return 1;   // glm_rmsnorm takes 1024 threads from 4096 columns
+    pdl_launch(hc_pre_rms_kernel, T, 1024, 0, GST, static_cast<const __nv_bfloat16*>(h), static_cast<const float*>(pre),
+               static_cast<__nv_bfloat16*>(hy), static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y), ldy, N, eps);
     GRET;
 }
 
@@ -1930,6 +2096,11 @@ int glm_argmax_combine(void* stream, const void* pairs, int world, int M, void* 
 // cb: 2 mul1, 3 / 4 exlr8's mcg rounded to E4M3, 5 / 6 exlr8's mul1 rounded to E4M3 (tidelm_kernels::exl3::CB_*)
 int glm_exl3_unpack_cb(void* stream, const void* trellis, int K, int N, int bits, int cb, void* w) {
     if (K % 16 || N % 128 || cb < 2 || cb > 6) return (int)cudaErrorInvalidValue;
+    if (bits <= 16 && ((uintptr_t)w & 15) == 0) {
+        pdl_launch(exl3_unpack8_kernel, dim3(K / 16, N / 128), 256, 0, GST, static_cast<const uint32_t*>(trellis), N / 16, N, bits,
+                   cb, static_cast<__half*>(w));
+        GRET;
+    }
     pdl_launch(exl3_unpack_kernel, dim3(K / 16, N / 128), 256, 0, GST, static_cast<const uint32_t*>(trellis), N / 16, N, bits,
                                                                cb, static_cast<__half*>(w));
     GRET;
@@ -2000,3 +2171,139 @@ int glm_rank1(void* stream, void* x, int64_t ldx, const void* r, float alpha, in
 }
 
 }  // extern "C"
+
+// ------------------------------------------------------------------ tuned prefill GEMM (prefill-pg)
+// y[m][n] f32 = x[m][k] f16 . W[k][n] f16 (row-major, the EXL3 dense prefill's GEMM). cuBLAS's default
+// pick is slow at some prefill shapes (K = 2048: 1.32 ms where a cublasLt tile takes 1.00). The first
+// call of a shape times cublasGemmEx against cublasLt's no-workspace, no-split-K algorithms on the real
+// operands and keeps one only if it is faster AND every output bit matches cublasGemmEx's; later calls
+// reuse the pick. Returns 1 when the caller should run cublasGemmEx itself (the default, stream capture,
+// any error).
+__global__ void neq_count_kernel(const uint32_t* __restrict__ a, const uint32_t* __restrict__ b, size_t n,
+                                 unsigned long long* __restrict__ c) {
+    unsigned long long d = 0;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        d += a[i] != b[i];
+    if (d) atomicAdd(c, d);
+}
+
+namespace {
+struct LtPick {
+    bool lt = false;
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+};
+std::mutex g_lt_mu;
+std::map<std::tuple<int, int, int, int, int, int>, LtPick> g_lt_picks;
+cublasLtHandle_t g_lt = nullptr;
+}  // namespace
+
+extern "C" int glm_gemm_f16f32_tuned(void* handle, int m, int n, int k, const void* x, int ldx, const void* w, int ldw,
+                                     void* y, int ldy) {
+    static int on = -1;
+    if (on < 0) { const char* v = getenv("TIDELM_GEMM_TUNE"); on = !(v && v[0] == '0'); }
+    if (!on) return 1;
+    cublasHandle_t h = static_cast<cublasHandle_t>(handle);
+    cudaStream_t st = nullptr;
+    if (cublasGetStream(h, &st) != CUBLAS_STATUS_SUCCESS) return 1;
+    std::lock_guard<std::mutex> lock(g_lt_mu);
+    const float one = 1.f, zero = 0.f;
+    auto key = std::make_tuple(m, n, k, ldx, ldw, ldy);
+    auto it = g_lt_picks.find(key);
+    if (it == g_lt_picks.end()) {
+        // only the full prefill chunks are tuned (m a multiple of 512, at most 64 shapes): a ragged last
+        // chunk would otherwise pay a tuning pass for every new row count
+        if (m % 512 || g_lt_picks.size() >= 64) return 1;
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) return 1;
+        LtPick pick;
+        auto ref = [&] {
+            return cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one, w, CUDA_R_16F, ldw, x, CUDA_R_16F, ldx, &zero, y,
+                                CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        };
+        bool ok = g_lt || cublasLtCreate(&g_lt) == CUBLAS_STATUS_SUCCESS;
+        ok = ok && cublasLtMatmulDescCreate(&pick.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS;
+        ok = ok && cublasLtMatrixLayoutCreate(&pick.A, CUDA_R_16F, n, k, ldw) == CUBLAS_STATUS_SUCCESS;
+        ok = ok && cublasLtMatrixLayoutCreate(&pick.B, CUDA_R_16F, k, m, ldx) == CUBLAS_STATUS_SUCCESS;
+        ok = ok && cublasLtMatrixLayoutCreate(&pick.C, CUDA_R_32F, n, m, ldy) == CUBLAS_STATUS_SUCCESS;
+        float* tmp = nullptr;
+        unsigned long long* cnt = nullptr;
+        const size_t ny = (size_t)m * ldy;
+        ok = ok && cudaMalloc(&tmp, ny * 4) == cudaSuccess && cudaMalloc(&cnt, 8) == cudaSuccess;
+        cudaEvent_t e0 = nullptr, e1 = nullptr;
+        ok = ok && cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
+        auto timeit = [&](auto&& fn) {
+            fn();
+            cudaEventRecord(e0, st);
+            for (int i = 0; i < 4; ++i) fn();
+            cudaEventRecord(e1, st);
+            cudaEventSynchronize(e1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            return ms;
+        };
+        if (ok) {
+            const float t_ref = timeit(ref);   // y holds the reference after this
+            cublasLtMatmulPreference_t pr = nullptr;
+            size_t wss = 0;
+            cublasLtMatmulHeuristicResult_t res[16];
+            int nres = 0;
+            if (cublasLtMatmulPreferenceCreate(&pr) == CUBLAS_STATUS_SUCCESS &&
+                cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wss, sizeof(wss)) ==
+                    CUBLAS_STATUS_SUCCESS &&
+                cublasLtMatmulAlgoGetHeuristic(g_lt, pick.op, pick.A, pick.B, pick.C, pick.C, pr, 16, res, &nres) ==
+                    CUBLAS_STATUS_SUCCESS) {
+                float best = t_ref * 0.97f;
+                for (int i = 0; i < nres; ++i) {
+                    if (res[i].state != CUBLAS_STATUS_SUCCESS || res[i].workspaceSize != 0) continue;
+                    int sk = 1;
+                    size_t sz = 0;
+                    cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &sk, sizeof(sk), &sz);
+                    if (sk > 1) continue;
+                    auto run = [&] {
+                        return cublasLtMatmul(g_lt, pick.op, &one, w, pick.A, x, pick.B, &zero, tmp, pick.C, tmp, pick.C,
+                                              &res[i].algo, nullptr, 0, st);
+                    };
+                    if (run() != CUBLAS_STATUS_SUCCESS) continue;
+                    cudaMemsetAsync(cnt, 0, 8, st);
+                    // every output bit against cublasGemmEx's (dense outputs only)
+                    unsigned long long d = 0;
+                    if (ldy == n) {
+                        neq_count_kernel<<<1024, 256, 0, st>>>(reinterpret_cast<const uint32_t*>(y),
+                                                               reinterpret_cast<const uint32_t*>(tmp), ny, cnt);
+                        cudaMemcpyAsync(&d, cnt, 8, cudaMemcpyDeviceToHost, st);
+                        cudaStreamSynchronize(st);
+                    } else {
+                        d = 1;   // strided outputs: not compared, not taken
+                    }
+                    if (d) continue;
+                    const float t = timeit(run);
+                    if (t < best) {
+                        best = t;
+                        pick.lt = true;
+                        pick.algo = res[i].algo;
+                    }
+                }
+            }
+            if (pr) cublasLtMatmulPreferenceDestroy(pr);
+            if (getenv("TIDELM_GEMM_TUNE_LOG"))
+                fprintf(stderr, "gemm tune m %d n %d k %d: default %.3f ms, %s\n", m, n, k, t_ref / 4,
+                        pick.lt ? "cublasLt pick" : "default kept");
+        }
+        if (e0) cudaEventDestroy(e0);
+        if (e1) cudaEventDestroy(e1);
+        if (tmp) cudaFree(tmp);
+        if (cnt) cudaFree(cnt);
+        it = g_lt_picks.emplace(key, pick).first;
+        if (!pick.lt) return ok ? 0 : 1;   // y already holds the reference result when ok
+        // else fall through: y holds the reference too, and the pick's bits are the same
+        return 0;
+    }
+    const LtPick& p = it->second;
+    if (!p.lt) return 1;
+    return cublasLtMatmul(g_lt, p.op, &one, w, p.A, x, p.B, &zero, y, p.C, y, p.C, &p.algo, nullptr, 0, st) ==
+                   CUBLAS_STATUS_SUCCESS
+               ? 0
+               : 1;
+}

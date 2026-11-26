@@ -614,7 +614,11 @@ impl Engine {
         let mtp_arena = if cfg.mtp {
             let l = cfg.mtp_layer();
             let items: Vec<(usize, usize)> = (0..e).map(|x| (l, x)).collect();
-            let (a, so) = class_arena(&pack, &items, None, world, cfg.hidden, cfg.moe_inter)?;
+            let (mut a, so) = class_arena(&pack, &items, None, world, cfg.hidden, cfg.moe_inter)?;
+            // prefill rows through the fat tile as the decoder's (prefill-pg): the grouped GEMV took
+            // ~35 ms a 2,048-row block here, 0.35 s of an 8K prefill, for a layer that only fills
+            // the drafter's cache. TIDELM_GLM_MTP_FAT=0: the grouped GEMV as before.
+            a.prefill_tiled = std::env::var("TIDELM_GLM_MTP_FAT").as_deref() != Ok("0");
             load_slots(&pack, &a, &items.iter().zip(&so).map(|(&(l, x), &s)| (s, l, x)).collect::<Vec<_>>())?;
             let mut lut = vec![0i32; e];
             for (x, &s) in so.iter().enumerate() {
@@ -1389,11 +1393,16 @@ impl Engine {
                 self.lin(gate_up, np(&a.xn), h, t, np(&a.gu), true)?;
                 let (n, uo, ld) = gate_up.gu_layout(t, GEMV_ROWS);
                 self.swiglu(&self.st, np(&a.gu), at(&a.gu, uo), ld, np(&a.dact), n, t)?;
-                self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?;
-                self.lin(down, np(&a.dfull), n * w, t, np(&a.shout), false)?;
+                // one rank (prefill-pg): no gathers, so the down reads dact and the bf16 lands in a
+                let one = w == 1 && moe_out_fuse();
+                let dsrc = if one { np(&a.dact) } else { self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?; np(&a.dfull) };
+                self.lin(down, dsrc, n * w, t, np(&a.shout), false)?;
                 let dn = down.n_total();
-                ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), np(&a.mout), (t * dn) as i64) }, "dense out")?;
-                self.gather_cols(np(&a.mout), t, dn, 2, np(&a.a), prefill)?;
+                let mo = if one { np(&a.a) } else { np(&a.mout) };
+                ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), mo, (t * dn) as i64) }, "dense out")?;
+                if !one {
+                    self.gather_cols(np(&a.mout), t, dn, 2, np(&a.a), prefill)?;
+                }
                 self.ablit_rows(l, np(&a.a), t)
             }
             Mlp::Moe { .. } | Mlp::Routed { .. } => {
@@ -1574,8 +1583,13 @@ impl Engine {
         let (sk_up, sk_dn) = self.routed_splits(arena, decode, n);
         // an exlr8 pack's sides are the layer's signs times one scale a 128-block: one rotation a row
         let shared = self.rot1 && is_exlr8(arena.cb);
+        // prefill-pg: the opt-in e4m3 gate/up (TIDELM_FP8_GU=1; changes numerics)
+        let fp8 = !shared && up_tiled && self.fat && !soft && h <= 4096 && fp8_gu();
         unsafe {
-            if shared {
+            if fp8 {
+                exl3m_rot_in8(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
+                              k as i32, 1, st);
+            } else if shared {
                 exl3m_rot_in_shared(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32,
                                     h as i32, k as i32, slots, 1, st);
             } else {
@@ -1586,6 +1600,12 @@ impl Engine {
                 exl3m_prefill_fat(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u), uids,
                                   np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, k as i32, nexp, 2,
                                   arena.cb, arena.max_k2.max(6), st);
+            } else if fp8 {
+                let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
+                exl3m_prefill_fat_gateup8(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
+                                          uids, np(&a.ucount), np(&a.members), h as i32, il as i32, p as i32, k as i32, nexp,
+                                          arena.cb, arena.max_k2.max(6), arena.pool(6), arena.pool(7), suh2,
+                                          cfg.moe_inter as i32, cfg.swiglu_limit, np(&a.pair), st);
             } else if up_tiled && self.fat {
                 // the fat tile with the epilogue fused: xd straight into the pair buffer
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
@@ -1623,6 +1643,8 @@ impl Engine {
                 self.l2_lin(sh_down, n, PF_SH_DOWN)?;
             }
         }
+        let mut xdf_p = np(&a.xdf);
+        let mut hf_p = np(&a.hf);
         // one gather: both ranks' [routed xd | shared act]
         let per = p * il * 2 + if shared_x.is_some() { n * il * 2 } else { 0 };
         if w > 1 {
@@ -1632,6 +1654,11 @@ impl Engine {
                 ck(unsafe { glm_unshard(st, at(&a.gs, p * il * 2), (per / 2) as i64, np(&a.hf), n as i32, il as i32, w as i32, 2) },
                    "unshard shared")?;
             }
+        } else if !decode && moe_out_fuse() {
+            // prefill at one rank (prefill-pg): the routed and shared downs read the pair buffer where it
+            // is - the copies are 134 MB a 4096-row chunk (1.2 ms of idle tensor cores a layer)
+            xdf_p = np(&a.pair);
+            hf_p = hsh;
         } else {
             // One box: the pair's collectives are copies (these two, the output's below, o_proj's f32 ->
             // bf16 in the attention). Reading each source where it is instead - 3 launches a MoE layer and
@@ -1653,28 +1680,35 @@ impl Engine {
             self.fork()?;
         }
         let part = if decode { &a.split_part2 } else { &a.split_part };
+        let mut fused_out = false;
         if let Some((_, sh_down)) = shared_x {
-            self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), 0, false)?;
+            self.lin_on(sst, x3, part, sh_down, hf_p, kd, n, np(&a.shout), 0, false)?;
         }
         unsafe {
             if up_tiled && self.fat {
-                exl3m_prefill_fat(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_fat(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                   uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, k as i32,
                                   nexp, 1, arena.cb, arena.max_k2.max(6), st);
             } else if up_tiled && mixed {
-                exl3m_prefill_smem_cb(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_smem_cb(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                       uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
                                       k as i32, nexp, 1, arena.cb, arena.max_k2, st);
             } else if up_tiled {
-                exl3m_prefill_smem_mode(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_smem_mode(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                         uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
                                         k as i32, nexp, 1, 4, 1, 8, -4, st);
             } else {
-                exl3m_grouped(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
+                exl3m_grouped(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
                               np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, sk_dn, maxm, k as i32,
                               nexp, 1, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
-            if shared {
+            if !shared && !decode && !side && self.world == 1 && moe_out_fuse() {
+                // the combine stores the layer's bf16 output (moe_out's arithmetic) where the gather would copy it
+                let sh = if shared_x.is_some() { np(&a.shout) as *const c_void } else { std::ptr::null() };
+                exl3m_down_combine_bf(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), sh, out, n as i32, p as i32, dn as i32,
+                                      if up_tiled { 1 } else { sk_dn }, k as i32, slots, st);
+                fused_out = true;
+            } else if shared {
                 exl3m_down_combine_shared(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32,
                                           dn as i32, if up_tiled { 1 } else { sk_dn }, k as i32, slots, st);
             } else {
@@ -1698,6 +1732,9 @@ impl Engine {
                 Some(crate::weights::Attn::Ink(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
                 None => {}
             }
+        }
+        if fused_out {
+            return Ok(());
         }
         if shared_x.is_some() {
             ck(unsafe { glm_moe_out(st, np(&a.local), np(&a.shout), np(&a.mout), (n * dn) as i64) }, "moe out")?;
@@ -3245,4 +3282,16 @@ impl Engine {
             }
         }
     }
+}
+
+/// prefill-pg's opt-in e4m3 routed gate/up (TIDELM_FP8_GU=1), read once
+fn fp8_gu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TIDELM_FP8_GU").as_deref() == Ok("1"))
+}
+
+/// prefill-pg: the routed combine writes the MoE layer's bf16 output (TIDELM_HC_FUSE=0 off)
+fn moe_out_fuse() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TIDELM_HC_FUSE").map(|v| v != "0").unwrap_or(true))
 }

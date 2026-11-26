@@ -1204,7 +1204,39 @@ impl Server {
         // cache row alone), the next ones the lanes whose chain goes on
         // Inkling 2: one block pass of the DSpark drafter a lane gives its 7 drafts at once (greedy:
         // q is a point mass, as a copy's), kept while the gate holds; no MTP layer, no chain of passes
-        let dspark = self.eng.has_drafter();
+        // DFlash2: one block round gives every non-plain, non-copy lane its drafts, scored by the
+        // target's own head over the same rows the last verify step ran. Beside DSpark's branch
+        // rather than inside it: DSpark drafts for Inkling 2, this for GLM-5.3-Flash, and the
+        // verification that follows is the same code.
+        if self.eng.dflash.is_some() {
+            for k in 0..blocks.len() {
+                if blocks[k].plain || blocks[k].copy {
+                    continue;
+                }
+                let p0 = blocks[k].p as i64 + 1;
+                // The taps hold the residuals of the rows the last pass ran, i.e. positions
+                // p0-1 .. p0+BLOCK-2 -- so the block's row i is at p0-1+i, not p0+i. Declaring the
+                // latter rotated every row a token ahead of its own content: a systematic
+                // off-by-one in both the RoPE and the walker's per-step row, which reads exactly
+                // like a drafter that never guesses right.
+                let bpos: Vec<i64> = (0..tidelm_dflash::BLOCK as i64).map(|i| p0 - 1 + i).collect();
+                // The short seed covers the BLOCK positions before the anchor, which is the window
+                // attention reads. `from` is the first of them: any earlier position in the ring
+                // was never written by this sequence.
+                let bseed: Vec<i64> = (0..tidelm_dflash::BLOCK as i64).map(|i| p0 - tidelm_dflash::BLOCK as i64 + i).collect();
+                let from = bseed[0].max(0);
+                let anchor = runs[blocks[k].i].anchor as i32;
+                let picks = self.eng.dflash_drafts(&[p0], &[from], &bpos, &bseed, &[anchor])?;
+                let dmax = blocks[k].dmax;
+                blocks[k].drafts = picks.into_iter().take(dmax).map(|d| d as u32).collect();
+                blocks[k].qs = vec![None; blocks[k].drafts.len()];
+            }
+        }
+        // Not both: DFlash2's seven picks and the MTP chain's seven compose a fifteen-row verify
+        // pass, which is what the row-count probe found (t=15 eight times, t=8 only twice). The tap's
+        // condition is t == VERIFY_ROWS, so the block's input came from those two stray passes and
+        // every other round drafted from stale residuals. One drafter a lane, chosen by attachment.
+        let dspark = self.eng.has_drafter() && self.eng.dflash.is_none();
         if dspark {
             for k in 0..blocks.len() {
                 if blocks[k].plain || blocks[k].copy {
@@ -1243,7 +1275,16 @@ impl Server {
                 }
             }
         }
-        let mtp_lanes: Vec<usize> = if dspark { vec![] } else { (0..blocks.len()).filter(|&k| !blocks[k].plain).collect() };
+        // A lane gets one drafter. This line is where DFlash2 lost its acceptance: with the MTP
+        // chain still running on the same lane, `drafts` held fourteen entries -- MTP's seven first
+        // -- and the acceptance loop stops at the first mismatch, so DFlash2's chain was never read.
+        // The round log is what showed it: drafts [8, 0, 13, 4, 8, 0, 0, 1001, 1002, ...] against a
+        // target starting at 1001, matching five in a row from entry seven on.
+        let mtp_lanes: Vec<usize> = if dspark || self.eng.dflash.is_some() {
+            vec![]
+        } else {
+            (0..blocks.len()).filter(|&k| !blocks[k].plain).collect()
+        };
         if !mtp_lanes.is_empty() {
             let logits = mtp_lanes.iter().any(|&k| !blocks[k].copy);
             if self.eng.has_draft_list() {
@@ -1431,6 +1472,7 @@ impl Server {
                 st.rounds += 1;
                 st.drafted += nd;
                 st.accepted += n_acc;
+                self.eng.note_dflash(n_acc);
                 if b.long {
                     st.long_copies += 1;
                 }

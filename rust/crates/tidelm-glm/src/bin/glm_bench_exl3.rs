@@ -66,7 +66,7 @@ fn main() -> Result<()> {
                 for i in 0..12 {
                     if std::env::var("WARM").is_ok() {
                     } else if let Some(f) = &flusher {
-                        f.decode(&st, &members, &scratch, x.raw(), f.k, 1, fout.raw(), true)?;
+                        f.decode(&st, &members, &scratch, x.raw(), f.k, 1, fout.raw(), 0, true)?;
                     } else {
                         flush.zero_async(&st)?;
                     }
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
                         d.zero_async(&st)?;
                     }
                     e0.record(&st)?;
-                    mat.decode(&st, &members, &scratch, x.raw(), mat.k, t, out.raw(), true)?;
+                    mat.decode(&st, &members, &scratch, x.raw(), mat.k, t, out.raw(), 0, true)?;
                     e1.record(&st)?;
                     e1.synchronize()?;
                     if i >= 2 {

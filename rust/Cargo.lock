@@ -1103,6 +1103,15 @@ name = "tidelm-cuda"
 version = "0.1.0"
 
 [[package]]
+name = "tidelm-dflash"
+version = "0.1.0"
+dependencies = [
+ "tidelm-cuda",
+ "tidelm-kernels",
+ "tidelm-model",
+]
+
+[[package]]
 name = "tidelm-engine"
 version = "0.1.0"
 dependencies = [
@@ -1113,6 +1122,7 @@ dependencies = [
  "tidelm-comm",
  "tidelm-core",
  "tidelm-cuda",
+ "tidelm-dflash",
  "tidelm-kernels",
  "tidelm-model",
  "tidelm-text",
@@ -1128,6 +1138,7 @@ dependencies = [
  "tidelm-comm",
  "tidelm-core",
  "tidelm-cuda",
+ "tidelm-dflash",
  "tidelm-engine",
  "tidelm-image",
  "tidelm-kernels",

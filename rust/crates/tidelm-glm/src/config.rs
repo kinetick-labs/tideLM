@@ -149,7 +149,27 @@ pub struct GlmConfig {
 
 impl GlmConfig {
     pub fn load(model_dir: &Path) -> Result<Self> {
-        let top: serde_json::Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
+        let mut top: serde_json::Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
+        // An exllamav3 conversion names quant_method "exl3" in config.json and leaves the codebook in
+        // the quantization_config.json beside it; read that rather than ask for a hand edit of the
+        // checkpoint. (The SAGE-REXL3 build is one: without this, the routed experts read as unknown.)
+        if top.get("quantization_config").and_then(|q| q.get("codebook")).is_none() {
+            if let Ok(b) = std::fs::read(model_dir.join("quantization_config.json")) {
+                if let Ok(side) = serde_json::from_slice::<serde_json::Value>(&b) {
+                    if let Some(cb) = side.get("codebook") {
+                        let q = top.get_mut("quantization_config");
+                        match q {
+                            Some(v) if v.is_object() => {
+                                v["codebook"] = cb.clone();
+                            }
+                            _ => {
+                                top["quantization_config"] = serde_json::json!({"quant_method": "exl3", "codebook": cb});
+                            }
+                        }
+                    }
+                }
+            }
+        }
         match top.get("model_type").and_then(|v| v.as_str()) {
             Some("glm_moe_dsa") => Self::load_glm53(&top),
             Some("glm5_next") => Self::load_flash(&top),

@@ -1248,6 +1248,25 @@ struct Resident {
     ids: DeviceBuffer<i32>,
 }
 
+/// The DFlash2 drafter as the serving loop holds it: weights, one block's buffers, one GEMM
+/// handle. Everything about it is per-model, not per-request.
+pub struct Dflash {
+    dr: tidelm_dflash::Drafter,
+    blk: tidelm_dflash::Block,
+    blas: tidelm_kernels::blas::Blas,
+}
+
+impl Dflash {
+    /// Open the drafter's own checkpoint and wire its block. Called once, after the model loads.
+    pub fn open(dir: &std::path::Path, stream: &Stream, rows: usize) -> Result<Self> {
+        let ck = Checkpoint::open(dir)?;
+        let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
+        let blk = tidelm_dflash::Block::new(&dr, rows).map_err(|e| format!("dflash: {e}"))?;
+        let blas = tidelm_kernels::blas::Blas::new(stream.raw()).map_err(|e| format!("dflash: {e}"))?;
+        Ok(Dflash { dr, blk, blas })
+    }
+}
+
 struct Dspark {
     blocks: Vec<Layer>,
     w: DsparkW,
@@ -1309,6 +1328,9 @@ pub struct Engine {
     /// steps run so far (Lane::step)
     step_no: u64,
     dspark: Option<Dspark>,
+    /// GLM_DRAFTER=dflash2: the DFlash2 drafter, its block buffers, and the GEMM handle they use.
+    /// Its taps come from `df_tap` after layers 5/14/24/33/42, not from `main_h`.
+    dflash: Option<Dflash>,
     resident: Option<Resident>,
     /// [layer][expert] routable mask (u8) for the router, both modes; None = all
     keep: Option<DeviceBuffer<u8>>,
@@ -1964,7 +1986,7 @@ impl Engine {
             ds_set_pdl(pdl as i32);
             fp4::fp4_moe_cuda_set_pdl(pdl as i32);
         }
-        Ok(Engine {
+        let mut engine = Engine {
             arena: Arena::new(ARENA_SLOTS + 1, None)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
             logits_host: PinnedBuffer::zeroed(tm * cfg.vocab_size)?,
@@ -1989,6 +2011,7 @@ impl Engine {
             max_lanes,
             step_no: 0,
             dspark,
+            dflash: None,
             resident,
             keep,
             demand,
@@ -2055,7 +2078,23 @@ impl Engine {
             pf_fork: Event::new()?,
             pf_join: Event::new()?,
             pf_open: std::cell::Cell::new(false),
-        })
+        };
+        engine.stream.synchronize()?;
+        // GLM_DRAFTER=dflash2: the drafter's own checkpoint, attached once. Everything it needs to
+        // draft comes from the taps the layer loop captures at 5/14/24/33/42.
+        if std::env::var("GLM_DRAFTER").as_deref() == Ok("dflash2") {
+            let dir = std::env::var_os("GLM_DRAFTER_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| model_dir.join("../glm53-dflash2"));
+            let df = Dflash::open(&dir, &engine.stream, tidelm_dflash::BLOCK * max_lanes)?;
+            // Said out loud at boot: with --depth also on, DSpark is attached too, and the two
+            // drafters are indistinguishable from the outside when only accept rates are printed.
+            println!("boot: DFlash2 drafter {} ({:.2} GiB, {} layers, block {}, {} rows)",
+                     dir.display(), df.dr.nbytes() as f64 / (1u64 << 30) as f64,
+                     tidelm_dflash::LAYERS, tidelm_dflash::BLOCK, tidelm_dflash::BLOCK * max_lanes);
+            engine.dflash = Some(df);
+        }
+        Ok(engine)
     }
 
     /// Join a pair before the first step (its MoE combines all-reduce over `pair.comm`).
@@ -3878,6 +3917,13 @@ impl Engine {
                 }
             }
             res?;
+            // DFlash2's taps: after layer `l`'s residual, its rows' 4-stream mean. The 8-row
+            // verify step is the only one a draft reads.
+            if t == tidelm_dflash::BLOCK {
+                if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
+                    df.blk.run.tap(&self.stream, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;
+                }
+            }
             self.times.compute_s += tc.elapsed().as_secs_f64();
             if let (Some(dir), false) = (&self.dump_dir, capturing) {
                 let mut hb = vec![0u16; self.live_rows * hc * d];
@@ -4098,7 +4144,26 @@ impl Engine {
     /// Resident with graphs, the whole draft is one CUDA graph per number of lanes, with a
     /// single read-back.
     pub fn draft_batch(&mut self, reqs: &[(usize, u32, usize)]) -> Result<Vec<Vec<u32>>> {
+        if self.dflash.is_some() {
+            return self.dflash_draft(reqs);
+        }
         Ok(self.draft_inner(reqs, None)?.into_iter().map(|d| d.0).collect())
+    }
+
+    /// DFlash2's draft: the taps the last 8-row step captured, one block pass, the target's own
+    /// head over those 8 rows (already in `act.logits`), the selector's walk.
+    ///
+    /// One lane today: `Block` is opened for `BLOCK * max_lanes` rows but only lane 0's eight are
+    /// tapped, and a second stream's rows would be the previous step's. Said out loud rather than
+    /// left to look like support for something it does not do.
+    fn dflash_draft(&mut self, _reqs: &[(usize, u32, usize)]) -> Result<Vec<Vec<u32>>> {
+        // Not maintained and not reachable: GLM-5.3-Flash is served by `tidelm_glm::forward::Engine`,
+        // whose `Dflash` is the one that has the taps, the tables and the row convention. This copy
+        // was written first, against `act.logits` (bf16) with a head kernel that reads f32, and the
+        // review found it would read `rows * vocab * 4` bytes out of a `rows * vocab * 2` buffer.
+        // Returning an error beats leaving a second answer to "which kernel scores the block"
+        // lying around for someone to call.
+        Err("dflash: this engine's copy is not maintained; see tidelm-glm::forward::Engine".into())
     }
 
     /// `draft_batch` with sampled drafts (fastdecode.py's DRAFT_NUCLEUS draft): per lane

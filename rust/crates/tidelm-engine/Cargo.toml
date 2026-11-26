@@ -10,6 +10,7 @@ tidelm-comm = { path = "../tidelm-comm" }
 tidelm-core = { path = "../tidelm-core" }
 tidelm-cuda = { path = "../tidelm-cuda" }
 tidelm-kernels = { path = "../tidelm-kernels" }
+tidelm-dflash = { path = "../tidelm-dflash" }
 tidelm-model = { path = "../tidelm-model" }
 tidelm-text = { path = "../tidelm-text" }
 libc = "0.2"

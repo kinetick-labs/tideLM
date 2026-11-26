@@ -33,7 +33,7 @@ use tidelm_kernels::glm::*;
 
 use crate::arena::{Arena, Pack};
 use crate::config::{AttnKind, GlmConfig};
-use crate::lin::Lin;
+use crate::lin::{Lin, RowStack};
 use crate::weights::{Exl3Mat, Exl3Scratch, Members, Mlp, Weights, DECODE_PF_ROUTED, MAX_ROWS};
 use crate::{ck, Result};
 
@@ -311,6 +311,43 @@ pub struct MtpRows<'a> {
     pub pos0: usize,
 }
 
+/// DFlash2 as the GLM engine holds it: the checkpoint's weights, one block's buffers (`VERIFY_ROWS`
+/// rows), and the GEMM handle they use. Per-model, not per-request.
+pub struct Dflash {
+    pub dr: tidelm_dflash::Drafter,
+    pub blk: tidelm_dflash::Block,
+    /// The drafter's own stream and GEMM handle. The engine's, reused, failed on the round's last
+    /// projection (m=8 n=256 k=4096, cublas status 13) after every GEMM before it had succeeded --
+    /// an interaction with the engine's handle state, not with the shapes.
+    pub own: Stream,
+    pub blas: Blas,
+    /// Rounds in a row that produced no accepted draft. At 8 the drafter stands down: one that
+    /// accepts nothing still pays the verify pass' eight rows and returns one token, which measured
+    /// 3,7x slower than not drafting at all (5,17 against 19,38 tok/s). Standing down recovers that
+    /// without a restart; only a new process brings it back, which is honest -- there is no evidence
+    /// that waiting helps a drafter whose input is empty.
+    miss: std::sync::atomic::AtomicU32,
+    /// Passes logged by the row-count probe, so one served request names the truth once.
+    logged: std::sync::atomic::AtomicU32,
+}
+
+impl Dflash {
+    /// Its own stream and a GEMM handle bound to it. The engine's handle was tried first and the
+    /// round's last projection failed with cublas status 13 there -- which turned out to be an
+    /// out-of-bounds read in ctx_kv landing on the next checked call, not the handle. The private
+    /// pair stays because removing it faulted glm_df_select; see a2274c5 and b61cab6.
+    pub fn open(dir: &Path, rows: usize) -> Result<Self> {
+        let ck = tidelm_model::Checkpoint::open(dir)?;
+        let dr = tidelm_dflash::Drafter::load(&ck).map_err(|e| format!("dflash: {e}"))?;
+        let blk = tidelm_dflash::Block::new(&dr, rows).map_err(|e| format!("dflash: {e}"))?;
+        let own = Stream::new()?;
+        let blas = Blas::new(own.raw()).map_err(|e| format!("dflash: {e}"))?;
+        Ok(Dflash { dr, blk, own, blas,
+                    miss: std::sync::atomic::AtomicU32::new(0),
+                    logged: std::sync::atomic::AtomicU32::new(0) })
+    }
+}
+
 pub struct Engine {
     pub cfg: GlmConfig,
     pub opt: Options,
@@ -492,6 +529,10 @@ pub struct Engine {
     ink: Option<inkling_fwd::InkState>,
     /// GLM-5.3-Flash's image input (flash_image; None: off)
     pub vis: Option<crate::flash_image::VisionState>,
+    /// GLM_DRAFTER=dflash2: the DFlash2 drafter's weights. This is the crate the GLM serving path
+    /// builds (`glm_main.rs` imports it), so it is where the drafter has to live -- the same work
+    /// in tidelm-engine's Model compiled and never ran.
+    pub dflash: Option<Dflash>,
 }
 
 fn np<T: Copy>(b: &DeviceBuffer<T>) -> *mut c_void {
@@ -573,7 +614,11 @@ impl Engine {
         let mtp_arena = if cfg.mtp {
             let l = cfg.mtp_layer();
             let items: Vec<(usize, usize)> = (0..e).map(|x| (l, x)).collect();
-            let (a, so) = class_arena(&pack, &items, None, world, cfg.hidden, cfg.moe_inter)?;
+            let (mut a, so) = class_arena(&pack, &items, None, world, cfg.hidden, cfg.moe_inter)?;
+            // prefill rows through the fat tile as the decoder's (prefill-pg): the grouped GEMV took
+            // ~35 ms a 2,048-row block here, 0.35 s of an 8K prefill, for a layer that only fills
+            // the drafter's cache. TIDELM_GLM_MTP_FAT=0: the grouped GEMV as before.
+            a.prefill_tiled = std::env::var("TIDELM_GLM_MTP_FAT").as_deref() != Ok("0");
             load_slots(&pack, &a, &items.iter().zip(&so).map(|(&(l, x), &s)| (s, l, x)).collect::<Vec<_>>())?;
             let mut lut = vec![0i32; e];
             for (x, &s) in so.iter().enumerate() {
@@ -685,7 +730,7 @@ impl Engine {
         let opt_chunk = opt.chunk;
 
         let moe_layers_res = moe_layers.clone();
-        let engine = Engine {
+        let mut engine = Engine {
             lut: DeviceBuffer::from_slice(&lut_h)?,
             allowed: DeviceBuffer::from_slice(&allowed_h)?,
             mtp_lut: DeviceBuffer::from_slice(&mtp_lut)?,
@@ -782,13 +827,75 @@ impl Engine {
             fl,
             ink,
             vis: None,
+            dflash: None,
         };
         engine.st.synchronize()?;
+        // GLM_DRAFTER=dflash2: DFlash2's own checkpoint, attached once, after the model's weights
+        // are on the device. Printed, not silent: with --depth also on, DSpark drafts too, and the
+        // two are indistinguishable from outside by their accept rates alone.
+        if std::env::var("GLM_DRAFTER").as_deref() == Ok("dflash2") {
+            let dir = std::env::var_os("GLM_DRAFTER_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| model_dir.join("../glm53-dflash2"));
+            let df = Dflash::open(&dir, VERIFY_ROWS)?;
+            println!("boot: DFlash2 drafter {} ({:.2} GiB, {} layers, block {}, {} rows)",
+                     dir.display(), df.dr.nbytes() as f64 / (1u64 << 30) as f64,
+                     tidelm_dflash::LAYERS, tidelm_dflash::BLOCK, VERIFY_ROWS);
+            engine.dflash = Some(df);
+        }
         Ok(engine)
     }
 
     pub fn stream(&self) -> &Stream {
         &self.st
+    }
+
+    /// DFlash2's seven drafts for a lane: the block's tables, the ring seeded from the taps the
+    /// last verify step captured, one round against the target's own head. Empty when no drafter
+    /// is attached, so the caller's loop needs no second condition.
+    pub fn dflash_drafts(&self, starts: &[i64], froms: &[i64], bpos: &[i64], bseed: &[i64], anchors: &[i32]) -> Result<Vec<i32>> {
+        let df = match self.dflash.as_ref() {
+            Some(d) => d,
+            None => return Ok(Vec::new()),
+        };
+        if df.miss.load(std::sync::atomic::Ordering::Relaxed) >= 8 {
+            return Ok(Vec::new());
+        }
+        // The engine's loop is serial here: join it, run the round on the drafter's own stream, and
+        // join back. Two syncs a round buy isolation from the engine's cublas handle state, which is
+        // what the status 13 was.
+        self.st.synchronize()?;
+        // The window first: the captured residuals of the sequence so far, a BLOCK rows a pass, so the
+        // ring holds the prompt's own state. Falls back to the block's eight rows while the capture
+        // is still shorter than a block.
+        let seeded = df.blk.seed_window(&df.own, &df.blas, &df.dr, starts[0])
+            .map_err(|e| format!("dflash window seed: {e}"))?;
+        if seeded == 0 {
+            df.blk.run.set_tables(&df.own, starts, froms, bpos, bseed).map_err(|e| format!("dflash tables: {e}"))?;
+            df.blk.seed_taps(&df.own, &df.blas, &df.dr).map_err(|e| format!("dflash seed: {e}"))?;
+        }
+        // The seed moved the tables; the block's round needs its own back.
+        df.blk.run.set_tables(&df.own, starts, froms, bpos, bseed).map_err(|e| format!("dflash tables: {e}"))?;
+        // The target's head is `vl` wide (147,456 at world 1), not the drafter checkpoint's
+        // VOCAB: scoring the block over the wrong stride read 68 KB past the logits buffer.
+        let picks = df.blk.round_bf16(&df.own, &df.blas, &df.dr, np(&self.act.head), anchors, self.vl)
+            .map_err(|e| format!("dflash round: {e}"))?;
+        df.own.synchronize()?;
+        Ok(picks)
+    }
+
+    /// One round's outcome, so the drafter can stand down when it is costing without returning.
+    pub fn note_dflash(&self, accepted: usize) {
+        let Some(df) = self.dflash.as_ref() else { return };
+        use std::sync::atomic::Ordering::Relaxed;
+        if accepted == 0 {
+            let m = df.miss.fetch_add(1, Relaxed) + 1;
+            if m == 8 {
+                eprintln!("dflash: 8 rounds without an accepted draft; drafting off for this process");
+            }
+        } else {
+            df.miss.store(0, Relaxed);
+        }
     }
 
     /// The host lut / allowed mirrors to the device (stream-ordered).
@@ -859,15 +966,17 @@ impl Engine {
     // ------------------------------------------------------------------ matrices
     /// x [rows][ldx] bf16 -> out [rows][N] through an EXL3 matrix's decode or prefill path.
     fn exl3(&self, m: &Exl3Mat, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
-        self.exl3_on(&self.st, &self.act.x3s, m, x, ldx, rows, out, out_bf16)
+        self.exl3_on(&self.st, &self.act.x3s, m, x, ldx, rows, out, 0, out_bf16)
     }
 
-    /// exl3 on a given stream with its own scratch (decode rows only off the main stream).
+    /// exl3 on a given stream with its own scratch (decode rows only off the main stream). `ldy`: the
+    /// output row stride in elements (0: tight, N a row) -- a stack part writes its columns into
+    /// the stack wider rows.
     #[allow(clippy::too_many_arguments)]
     fn exl3_on(&self, st: &Stream, x3: &Exl3Scratch, m: &Exl3Mat, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void,
-               out_bf16: bool) -> Result<()> {
+               ldy: usize, out_bf16: bool) -> Result<()> {
         if rows <= MAX_ROWS {
-            m.decode(st, &self.members, x3, x, ldx, rows, out, out_bf16)
+            m.decode(st, &self.members, x3, x, ldx, rows, out, ldy, out_bf16)
         } else if rows <= GEMV_ROWS {
             // a short prompt: the decode GEMV over 16-row blocks reads each trellis rows / 16
             // times, where unpacking it writes and rereads 2 bytes a weight (16 bits against 3-5)
@@ -875,14 +984,14 @@ impl Engine {
             for r0 in (0..rows).step_by(MAX_ROWS) {
                 let n = MAX_ROWS.min(rows - r0);
                 let xi = unsafe { (x as *const u16).add(r0 * ldx) } as *const c_void;
-                let oi = unsafe { (out as *mut u8).add(r0 * m.g * m.n * esz) } as *mut c_void;
-                m.decode(st, &self.members, x3, xi, ldx, n, oi, out_bf16)?;
+                let oi = unsafe { (out as *mut u8).add(r0 * if ldy > 0 { ldy } else { m.g * m.n } * esz) } as *mut c_void;
+                m.decode(st, &self.members, x3, xi, ldx, n, oi, ldy, out_bf16)?;
             }
             Ok(())
         } else {
             for g in 0..m.g {
-                let o = unsafe { (out as *mut u8).add(g * rows * m.n * if out_bf16 { 2 } else { 4 }) } as *mut c_void;
-                m.prefill(&self.st, &self.blas, &self.act.x3s, g, x, ldx, rows, o, out_bf16)?;
+                let o = unsafe { (out as *mut u8).add(g * rows * if ldy > 0 { ldy } else { m.n } * if out_bf16 { 2 } else { 4 }) } as *mut c_void;
+                m.prefill(&self.st, &self.blas, &self.act.x3s, g, x, ldx, rows, o, ldy, out_bf16)?;
             }
             Ok(())
         }
@@ -892,16 +1001,42 @@ impl Engine {
     /// (exl3_on), or ds41.cu's FP8 / BF16 GEMV and GEMM (lin::gemm, `part` its split-K partials).
     #[allow(clippy::too_many_arguments)]
     fn lin_on(&self, st: &Stream, x3: &Exl3Scratch, part: &DeviceBuffer<f32>, m: &Lin, x: *const c_void, ldx: usize, rows: usize,
-              out: *mut c_void, out_bf16: bool) -> Result<()> {
+              out: *mut c_void, ldy: usize, out_bf16: bool) -> Result<()> {
         match m {
-            Lin::Exl3(e) => self.exl3_on(st, x3, e, x, ldx, rows, out, out_bf16),
-            _ => crate::lin::gemm(st, part, x, ldx, m, rows, out, !out_bf16, m.n_total()),
+            Lin::Exl3(e) => self.exl3_on(st, x3, e, x, ldx, rows, out, ldy, out_bf16),
+            _ => crate::lin::gemm(st, part, x, ldx, m, rows, out, !out_bf16, if ldy > 0 { ldy } else { m.n_total() }),
         }
+    }
+
+    /// A RowStack: each part over the same input, its output columns one after another in one
+    /// buffer rows (at the stack stride). The EXL3 parts epilogues and the dense parts GEMM
+    /// both take the stride, so the stack needs no copy.
+    #[allow(clippy::too_many_arguments)]
+    fn lin_stack_on(&self, st: &Stream, x3: &Exl3Scratch, part: &DeviceBuffer<f32>, s: &RowStack, x: *const c_void, ldx: usize,
+                    rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
+        let ldy = s.n_total();
+        let esz = if out_bf16 { 2 } else { 4 };
+        let mut off = 0;
+        // a multi-group EXL3 part interleaves its groups' rows (decode) or writes sequential
+        // blocks (prefill): neither matches a stack's column offsets, and every stack member is
+        // built split 1.
+        debug_assert!(s.parts.iter().all(|m| !matches!(m, Lin::Exl3(e) if e.g > 1)), "a stacked EXL3 part split > 1");
+        for m in &s.parts {
+            let o = unsafe { (out as *mut u8).add(off * esz) } as *mut c_void;
+            self.lin_on(st, x3, part, m, x, ldx, rows, o, ldy, out_bf16)?;
+            off += m.n_total();
+        }
+        Ok(())
     }
 
     /// lin_on on the main stream.
     fn lin(&self, m: &Lin, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
-        self.lin_on(&self.st, &self.act.x3s, &self.act.split_part, m, x, ldx, rows, out, out_bf16)
+        self.lin_on(&self.st, &self.act.x3s, &self.act.split_part, m, x, ldx, rows, out, 0, out_bf16)
+    }
+
+    /// A RowStack on the main stream.
+    fn lin_stack(&self, s: &RowStack, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
+        self.lin_stack_on(&self.st, &self.act.x3s, &self.act.split_part, s, x, ldx, rows, out, out_bf16)
     }
 
     /// A Lin's first `budget` bytes into L2 (l2_mat for an EXL3 matrix; a dense one from its start).
@@ -913,6 +1048,16 @@ impl Engine {
                 self.l2_runs(base, bytes.min(budget as u64), 0, 1)
             }
         }
+    }
+
+    /// A RowStack's first `budget` bytes into L2: the budget over its parts, each from its start.
+    fn l2_stack(&self, s: &RowStack, rows: usize, budget: usize) -> Result<()> {
+        let n = s.parts.len();
+        for (i, m) in s.parts.iter().enumerate() {
+            let b = budget * (i + 1) / n - budget * i / n;
+            self.l2_lin(m, rows, b)?;
+        }
+        Ok(())
     }
 
     /// The SwiGLU of gate / up halves (`ld` apart a row) -> bf16 [t][n]: GLM-5.3's glm_swiglu, or
@@ -1033,7 +1178,7 @@ impl Engine {
         if decode {
             self.fork()?;
         }
-        self.exl3_on(sst, x3, &lw.kv_a, np(&a.xn), h, t, np(&a.ckv), true)?;
+        self.exl3_on(sst, x3, &lw.kv_a, np(&a.xn), h, t, np(&a.ckv), 0, true)?;
         let ldk = lw.kv_a.n;
         ck(unsafe { glm_rmsnorm(s2, np(&a.ckv), ldk as i64, std::ptr::null(), 0, np(&lw.kv_norm), np(&a.c), 512, t as i32, 512,
                                 1e-6) }, "kv norm")?;
@@ -1063,7 +1208,7 @@ impl Engine {
         let index_decode = |ist: &Stream, x3: &Exl3Scratch| -> Result<()> {
             let ix = lw.index.as_ref().unwrap();
             let s = ist.raw();
-            self.exl3_on(ist, x3, &ix.wq_b, np(&a.qr), cfg.q_lora, t, np(&a.qi), true)?;
+            self.exl3_on(ist, x3, &ix.wq_b, np(&a.qr), cfg.q_lora, t, np(&a.qi), 0, true)?;
             ck(unsafe { glm_rope(s, np(&a.qi), 4096, 128, np(&a.qi), 4096, 128, t as i32, 32, np(&self.w.cos), np(&self.w.sin),
                                  posb) }, "rope index q")?;
             let (ix_q, ix_s) = (kv.iq.unwrap().raw(), kv.is.unwrap().raw());
@@ -1248,11 +1393,16 @@ impl Engine {
                 self.lin(gate_up, np(&a.xn), h, t, np(&a.gu), true)?;
                 let (n, uo, ld) = gate_up.gu_layout(t, GEMV_ROWS);
                 self.swiglu(&self.st, np(&a.gu), at(&a.gu, uo), ld, np(&a.dact), n, t)?;
-                self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?;
-                self.lin(down, np(&a.dfull), n * w, t, np(&a.shout), false)?;
+                // one rank (prefill-pg): no gathers, so the down reads dact and the bf16 lands in a
+                let one = w == 1 && moe_out_fuse();
+                let dsrc = if one { np(&a.dact) } else { self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?; np(&a.dfull) };
+                self.lin(down, dsrc, n * w, t, np(&a.shout), false)?;
                 let dn = down.n_total();
-                ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), np(&a.mout), (t * dn) as i64) }, "dense out")?;
-                self.gather_cols(np(&a.mout), t, dn, 2, np(&a.a), prefill)?;
+                let mo = if one { np(&a.a) } else { np(&a.mout) };
+                ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), mo, (t * dn) as i64) }, "dense out")?;
+                if !one {
+                    self.gather_cols(np(&a.mout), t, dn, 2, np(&a.a), prefill)?;
+                }
                 self.ablit_rows(l, np(&a.a), t)
             }
             Mlp::Moe { .. } | Mlp::Routed { .. } => {
@@ -1339,7 +1489,7 @@ impl Engine {
     fn shared_up(&self, sst: &Stream, x3: &Exl3Scratch, sh_gate_up: &Lin, il: usize, x: *mut c_void, n: usize) -> Result<()> {
         let a = &self.act;
         let part = if std::ptr::eq(sst, &self.st2) { &a.split_part2 } else { &a.split_part };
-        self.lin_on(sst, x3, part, sh_gate_up, x, self.cfg.hidden, n, np(&a.gu), true)?;
+        self.lin_on(sst, x3, part, sh_gate_up, x, self.cfg.hidden, n, np(&a.gu), 0, true)?;
         let hsh = at(&a.pair, n * self.cfg.topk * il * 2);
         let (hn, uo, ld) = sh_gate_up.gu_layout(n, GEMV_ROWS);
         debug_assert_eq!(hn, il);
@@ -1423,7 +1573,11 @@ impl Engine {
                                        np(&a.block_slot), np(&a.block_pair), np(&a.block_route), 64) }, "route blocks")?;
             ck(unsafe { glm_member_codes(st, np(&a.block_pair), nb * 64, k as i32, np(&a.members)) }, "member codes")?;
             ck(unsafe { glm_count_live(st, np(&a.block_slot), nb, np(&a.ucount)) }, "live blocks")?;
-            (64, nb)
+            // prefill-27k: the expert kernels' grid bounds the blocks this layer's picks can fill (its
+            // experts and the transient slot), not every slot's: at a 4096-row chunk 800 routing blocks,
+            // not 12,245 - the rest were programs that exit on ucount (TIDELM_TIGHT_GRID=0: as before)
+            let reach = if tight_grid() { arena.slots.min(cfg.experts + 1) } else { arena.slots };
+            (64, unsafe { ds_route_blocks(p as i32, reach as i32, 64) }.min(nb))
         };
         let uids = if decode { np(&a.uids) } else { np(&a.block_slot) };
         // prefill: the smem tile for the decoder's arena (the shipped mul1 2-3-bit kernel, or the
@@ -1433,8 +1587,13 @@ impl Engine {
         let (sk_up, sk_dn) = self.routed_splits(arena, decode, n);
         // an exlr8 pack's sides are the layer's signs times one scale a 128-block: one rotation a row
         let shared = self.rot1 && is_exlr8(arena.cb);
+        // prefill-pg: the opt-in e4m3 gate/up (TIDELM_FP8_GU=1; changes numerics)
+        let fp8 = !shared && up_tiled && self.fat && !soft && h <= 4096 && fp8_gu();
         unsafe {
-            if shared {
+            if fp8 {
+                exl3m_rot_in8(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
+                              k as i32, 1, st);
+            } else if shared {
                 exl3m_rot_in_shared(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32,
                                     h as i32, k as i32, slots, 1, st);
             } else {
@@ -1445,6 +1604,12 @@ impl Engine {
                 exl3m_prefill_fat(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u), uids,
                                   np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, k as i32, nexp, 2,
                                   arena.cb, arena.max_k2.max(6), st);
+            } else if fp8 {
+                let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
+                exl3m_prefill_fat_gateup8(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
+                                          uids, np(&a.ucount), np(&a.members), h as i32, il as i32, p as i32, k as i32, nexp,
+                                          arena.cb, arena.max_k2.max(6), arena.pool(6), arena.pool(7), suh2,
+                                          cfg.moe_inter as i32, cfg.swiglu_limit, np(&a.pair), st);
             } else if up_tiled && self.fat {
                 // the fat tile with the epilogue fused: xd straight into the pair buffer
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
@@ -1482,6 +1647,8 @@ impl Engine {
                 self.l2_lin(sh_down, n, PF_SH_DOWN)?;
             }
         }
+        let mut xdf_p = np(&a.xdf);
+        let mut hf_p = np(&a.hf);
         // one gather: both ranks' [routed xd | shared act]
         let per = p * il * 2 + if shared_x.is_some() { n * il * 2 } else { 0 };
         if w > 1 {
@@ -1491,6 +1658,11 @@ impl Engine {
                 ck(unsafe { glm_unshard(st, at(&a.gs, p * il * 2), (per / 2) as i64, np(&a.hf), n as i32, il as i32, w as i32, 2) },
                    "unshard shared")?;
             }
+        } else if !decode && moe_out_fuse() {
+            // prefill at one rank (prefill-pg): the routed and shared downs read the pair buffer where it
+            // is - the copies are 134 MB a 4096-row chunk (1.2 ms of idle tensor cores a layer)
+            xdf_p = np(&a.pair);
+            hf_p = hsh;
         } else {
             // One box: the pair's collectives are copies (these two, the output's below, o_proj's f32 ->
             // bf16 in the attention). Reading each source where it is instead - 3 launches a MoE layer and
@@ -1512,28 +1684,35 @@ impl Engine {
             self.fork()?;
         }
         let part = if decode { &a.split_part2 } else { &a.split_part };
+        let mut fused_out = false;
         if let Some((_, sh_down)) = shared_x {
-            self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
+            self.lin_on(sst, x3, part, sh_down, hf_p, kd, n, np(&a.shout), 0, false)?;
         }
         unsafe {
             if up_tiled && self.fat {
-                exl3m_prefill_fat(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_fat(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                   uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, k as i32,
                                   nexp, 1, arena.cb, arena.max_k2.max(6), st);
             } else if up_tiled && mixed {
-                exl3m_prefill_smem_cb(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_smem_cb(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                       uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
                                       k as i32, nexp, 1, arena.cb, arena.max_k2, st);
             } else if up_tiled {
-                exl3m_prefill_smem_mode(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_smem_mode(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                         uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
                                         k as i32, nexp, 1, 4, 1, 8, -4, st);
             } else {
-                exl3m_grouped(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
+                exl3m_grouped(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
                               np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, sk_dn, maxm, k as i32,
                               nexp, 1, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
-            if shared {
+            if !shared && !decode && !side && self.world == 1 && moe_out_fuse() {
+                // the combine stores the layer's bf16 output (moe_out's arithmetic) where the gather would copy it
+                let sh = if shared_x.is_some() { np(&a.shout) as *const c_void } else { std::ptr::null() };
+                exl3m_down_combine_bf(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), sh, out, n as i32, p as i32, dn as i32,
+                                      if up_tiled { 1 } else { sk_dn }, k as i32, slots, st);
+                fused_out = true;
+            } else if shared {
                 exl3m_down_combine_shared(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32,
                                           dn as i32, if up_tiled { 1 } else { sk_dn }, k as i32, slots, st);
             } else {
@@ -1552,11 +1731,14 @@ impl Engine {
                     self.l2_mat(&m.q_a, n, PF_QA)?;
                     self.l2_mat(&m.kv_a, n, PF_KVA)?;
                 }
-                Some(crate::weights::Attn::Kda(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
-                Some(crate::weights::Attn::Dsa(d)) => self.l2_lin(&d.proj_a, n, PF_QA + PF_KVA)?,
+                Some(crate::weights::Attn::Kda(k)) => self.l2_stack(&k.proj, n, PF_QA + PF_KVA)?,
+                Some(crate::weights::Attn::Dsa(d)) => self.l2_stack(&d.proj_a, n, PF_QA + PF_KVA)?,
                 Some(crate::weights::Attn::Ink(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
                 None => {}
             }
+        }
+        if fused_out {
+            return Ok(());
         }
         if shared_x.is_some() {
             ck(unsafe { glm_moe_out(st, np(&a.local), np(&a.shout), np(&a.mout), (n * dn) as i64) }, "moe out")?;
@@ -1687,6 +1869,39 @@ impl Engine {
         for l in 0..self.cfg.layers {
             self.layer_pre(l, t, prefill)?;
             self.mlp(l, t, prefill)?;
+            // DFlash2's taps: these layers' residuals, on the 8-row verify step only. `layer_pre`
+            // delegates to flash_layer_pre when cfg.hc is set (the GLM-5.3-Flash path), which is
+            // why the tap sits here, after mlp, rather than inside either of them.
+            // Row-count probe: `t == VERIFY_ROWS` is the tap's whole condition, and a tap that never
+            // fires leaves the block reading whatever `cin` held at allocation. Log the first passes'
+            // row counts once, at layer 0, so one served request names the truth.
+            if l == 0 {
+                if let Some(df) = self.dflash.as_ref() {
+                    let n = df.logged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 12 {
+                        eprintln!("dflash pass: t={t} target={VERIFY_ROWS}");
+                    }
+                }
+            }
+            // The window capture: a prefill chunk is the only pass with WIN rows of residuals, and
+            // those rows are what the seed needs to speak for the prompt instead of for eight keys.
+            if t > 2 * VERIFY_ROWS {
+                if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
+                    df.blk.run.tap_window(&self.st, np(&self.act.h), np(&self.act.pos), slot, t, 0)
+                        .map_err(|e| format!("dflash window tap: {e}"))?;
+                }
+            }
+            // A verify pass carries one block per lane, packed back to back (`row0 += 1 + nd` in
+            // serve.rs), so its width is the sum over lanes -- 15 for two blocks of eight and seven,
+            // which is why `t == VERIFY_ROWS` was true twice a request and never on the round that
+            // mattered. The drafter reads the first block's rows, and this hook taps rows 0..8 of the
+            // pass: correct while the drafting lane is the first block, which is what `one lane at a
+            // time` buys. A prefill chunk is wider than two blocks and stays out by the upper bound.
+            if t >= VERIFY_ROWS && t <= 2 * VERIFY_ROWS {
+                if let (Some(df), Some(slot)) = (self.dflash.as_ref(), tidelm_dflash::tap_slot(l)) {
+                    df.blk.run.tap(&self.st, np(&self.act.h), slot).map_err(|e| format!("dflash tap: {e}"))?;
+                }
+            }
         }
         self.prefetch_join()?;
         self.final_norm(t)
@@ -2146,11 +2361,17 @@ impl Act {
         .max()
         .unwrap();
         let max_k = (2 * h).max(cfg.inter).max(cfg.heads / world * 256);
-        let max_kn = [cfg.inter * h / world, 2 * h * h / world, hl * 256 * h, h * cfg.heads / world * 256, cfg.q_lora * 4096]
+        // A stacked part is its own prefill call, so the scratch must hold the widest single one:
+        // a checkpoint that fuses the KDA q|k|v into one matrix asks for 3 dl x h.
+        let max_kn = [cfg.inter * h / world, 2 * h * h / world, hl * 256 * h, h * cfg.heads / world * 256, cfg.q_lora * 4096,
+                      cfg.kda.map(|k| 3 * k.heads * k.dim * h).unwrap_or(0)]
             .into_iter()
             .max()
             .unwrap();
-        let max_zn = (r * (hl * 256).max(4096).max(h)).max(8 * d * 2 * 6144);
+        // z holds a prefill part's [rows][n] fp32 output: the widest single part is a checkpoint's
+        // fused KDA q|k|v, 3 dl columns (a chunk is up to `r` rows).
+        let wide = cfg.kda.map(|k| 3 * k.heads * k.dim).unwrap_or(0);
+        let max_zn = (r * (hl * 256).max(4096).max(h).max(wide)).max(8 * d * 2 * 6144);
         Ok(Act {
             tok: DeviceBuffer::zeroed(r)?,
             lanes: DeviceBuffer::zeroed(2 * MAX_LANES * 4)?,
@@ -3065,4 +3286,22 @@ impl Engine {
             }
         }
     }
+}
+
+/// prefill-27k: the routed expert kernels' grid over the blocks one layer can fill (default on)
+fn tight_grid() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TIDELM_TIGHT_GRID").as_deref() != Ok("0"))
+}
+
+/// prefill-pg's opt-in e4m3 routed gate/up (TIDELM_FP8_GU=1), read once
+fn fp8_gu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TIDELM_FP8_GU").as_deref() == Ok("1"))
+}
+
+/// prefill-pg: the routed combine writes the MoE layer's bf16 output (TIDELM_HC_FUSE=0 off)
+fn moe_out_fuse() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TIDELM_HC_FUSE").map(|v| v != "0").unwrap_or(true))
 }

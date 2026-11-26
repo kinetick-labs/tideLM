@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <cstdlib>
 #include <algorithm>
 #include <utility>
 
@@ -313,13 +314,21 @@ int launch_skinny(cudaStream_t st, const void* x, int64_t ldx, int64_t gstride, 
     // (wq_b at 12 rows 143 -> 189, wo_b 201 -> 227). M takes the exact tile up to 6 rows and
     // 8 / 12 / 16 above (the old tiers computed 6-row steps as 8).
     const bool wide = KIND == 0 && M > 8;
-    const int rows = wide ? 2 : 1;
+    // prefill-pg: past 16 rows (a prefill chunk's router), four weight rows a warp - each staged x value
+    // feeds four products instead of one (the 16-row tile was bound on its shared-memory reads); the
+    // per-output arithmetic is the same at any rows a warp (TIDELM_SKINNY_TALL=0 off)
+    static int tall_on = -1;
+    if (tall_on < 0) { const char* v = getenv("TIDELM_SKINNY_TALL"); tall_on = !(v && v[0] == '0'); }
+    const bool tall = KIND != 0 && M > 16 && tall_on;
+    const int rows = wide ? 2 : tall ? 4 : 1;
     const int mt = M <= 6 ? M : M <= 8 ? 8 : M <= 12 ? 12 : 16;
     // past 16 rows, 16-row tiles over gridDim.z (the slices a caller used to launch one by one)
     dim3 grid((N + kWarps * rows - 1) / (kWarps * rows), splits, (M + mt - 1) / mt);
 #define DS_SKINNY(R, MT, U) \
     pdl_launch(skinny_kernel<KIND, R, MT, U>, grid, kThreads, 0, st, xb, ldx, gstride, rpg, wb, sb, lds, M, N, K, ksplit, yb, yff, ldy, pp)
-    if (wide) {
+    if (tall) {
+        DS_SKINNY(4, 16, 2);
+    } else if (wide) {
         if (mt == 12) DS_SKINNY(2, 12, 2);
         else DS_SKINNY(2, 16, 2);
     } else {
@@ -1306,6 +1315,56 @@ __global__ void hc_post_kernel(const __nv_bfloat16* __restrict__ y, const __nv_b
         o[j] = post[m * HC + j] * yv + mixed;
     }
     for (int j = 0; j < HC; ++j) out[((int64_t)m * HC + j) * D + d] = to_bf(o[j]);
+}
+
+// hc_post_kernel then row_rsqrt_v8_kernel on its output in one pass (prefill-pg): a 1024-thread block
+// a row walks the row's hc * D / 8 pieces as row_rsqrt_v8_kernel does (piece i, i + 1024, ...), each
+// piece's outputs computed as hc_post_kernel computes them and their squares summed in that order, so
+// both outputs keep their bits. In place: every read is done before the block's first write.
+constexpr int kHcPieces = 2;   // pieces a thread: hc * D / 8 <= 1024 * kHcPieces
+__global__ void __launch_bounds__(1024) hc_post_rsq_kernel(const __nv_bfloat16* __restrict__ y, const __nv_bfloat16* residual,
+                                                           const float* __restrict__ post, const float* __restrict__ comb,
+                                                           __nv_bfloat16* out, int D, float eps, float* __restrict__ rsq) {
+    pdl_enter();
+    constexpr int HC = 4;
+    __shared__ float scratch[32];
+    const int m = blockIdx.x;
+    const int np = HC * D / 8, per = D / 8;
+    const float* cm = comb + m * HC * HC;
+    uint4 ov[kHcPieces];
+    float ss = 0.f;
+#pragma unroll
+    for (int u = 0; u < kHcPieces; ++u) {
+        const int i = threadIdx.x + 1024 * u;
+        if (i >= np) break;
+        const int j = i / per, d = (i % per) * 8;
+        float yv[8], r[HC][8];
+        bf16x8_to_f32(*reinterpret_cast<const uint4*>(y + (int64_t)m * D + d), yv);
+#pragma unroll
+        for (int c = 0; c < HC; ++c)
+            bf16x8_to_f32(*reinterpret_cast<const uint4*>(residual + ((int64_t)m * HC + c) * D + d), r[c]);
+        __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&ov[u]);
+        const float pj = post[m * HC + j];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float mixed = cm[0 * HC + j] * r[0][e];
+#pragma unroll
+            for (int c = 1; c < HC; ++c) mixed = fmaf(cm[c * HC + j], r[c][e], mixed);
+            oe[e] = to_bf(pj * yv[e] + mixed);
+            const float f = bf(oe[e]);
+            ss = fmaf(f, f, ss);
+        }
+    }
+    __syncthreads();   // in place: every thread's reads before any write
+#pragma unroll
+    for (int u = 0; u < kHcPieces; ++u) {
+        const int i = threadIdx.x + 1024 * u;
+        if (i >= np) break;
+        const int j = i / per, d = (i % per) * 8;
+        *reinterpret_cast<uint4*>(out + ((int64_t)m * HC + j) * D + d) = ov[u];
+    }
+    const float t = block_sum(ss, scratch);
+    if (threadIdx.x == 0) rsq[m] = rsqrtf(t * (1.f / (float)(HC * D)) + eps);
 }
 
 // ------------------------------------------------------------------ rope
@@ -3683,6 +3742,18 @@ int ds_hc_post(void* stream, const void* y, const void* residual, const void* po
     pdl_launch(hc_post_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(y), static_cast<const __nv_bfloat16*>(residual),
         static_cast<const float*>(post), static_cast<const float*>(comb), static_cast<__nv_bfloat16*>(out), D);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// ds_hc_post then ds_row_rsqrt(out, hc * D) in one launch; 1 = not this shape (call the two).
+int ds_hc_post_rsq(void* stream, const void* y, const void* residual, const void* post, const void* comb, void* out,
+                   int M, int D, float eps, void* rsq) {
+    if (D % 8 || 4 * D / 8 > 1024 * kHcPieces || ((uintptr_t)y & 15) || ((uintptr_t)residual & 15) || ((uintptr_t)out & 15))
+        return 1;
+    pdl_launch(hc_post_rsq_kernel, M, 1024, 0, static_cast<cudaStream_t>(stream),
+        static_cast<const __nv_bfloat16*>(y), static_cast<const __nv_bfloat16*>(residual),
+        static_cast<const float*>(post), static_cast<const float*>(comb), static_cast<__nv_bfloat16*>(out), D, eps,
+        static_cast<float*>(rsq));
     return static_cast<int>(cudaGetLastError());
 }
 

@@ -116,14 +116,14 @@ fn main() -> Result<()> {
                 m.pf = 1;
                 m.nt = 8;
                 out.zero_async(&st)?;
-                m.decode(&st, &members, &scratch, xr.raw(), m.k, rows, out.raw(), false)?;
+                m.decode(&st, &members, &scratch, xr.raw(), m.k, rows, out.raw(), 0, false)?;
                 out.download_async(0, &mut a, &st)?;
                 st.synchronize()?;
                 for (pf, nt) in [(-2i32, 8usize), (-2, 4), (-3, 8)] {
                     m.pf = pf;
                     m.nt = nt;
                     out.zero_async(&st)?;
-                    m.decode(&st, &members, &scratch, xr.raw(), m.k, rows, out.raw(), false)?;
+                    m.decode(&st, &members, &scratch, xr.raw(), m.k, rows, out.raw(), 0, false)?;
                     out.download_async(0, &mut b, &st)?;
                     st.synchronize()?;
                     let used = rows * m.g * m.n;
@@ -149,13 +149,13 @@ fn main() -> Result<()> {
     for round in 0..3 {
         for (i, m) in seq.iter().enumerate() {
             if let Some(f) = &flusher {
-                f.decode(&st, &members, &scratch, x.raw(), f.k, 1, out.raw(), true)?;
+                f.decode(&st, &members, &scratch, x.raw(), f.k, 1, out.raw(), 0, true)?;
             }
             if dirty_mb > 0 {
                 dirty.zero_async(&st)?;
             }
             evs[2 * i].record(&st)?;
-            m.decode(&st, &members, &scratch, x.raw(), m.k, rows, out.raw(), bf16)?;
+            m.decode(&st, &members, &scratch, x.raw(), m.k, rows, out.raw(), 0, bf16)?;
             evs[2 * i + 1].record(&st)?;
             if env("SYNC").is_some() {
                 evs[2 * i + 1].synchronize()?;
@@ -198,14 +198,14 @@ fn qb_iq(ck: &tidelm_model::Checkpoint, ld: &Loader, st: &Stream, members: &Memb
                 if side {
                     fork.record(st)?;
                     st3.wait_event(&fork)?;
-                    iq.decode(&st3, members, &s3, x.raw(), 2048, rows, o3.raw(), true)?;
+                    iq.decode(&st3, members, &s3, x.raw(), 2048, rows, o3.raw(), 0, true)?;
                     join.record(&st3)?;
                 }
-                qb.decode(st, members, &s1, x.raw(), 2048, rows, o1.raw(), true)?;
+                qb.decode(st, members, &s1, x.raw(), 2048, rows, o1.raw(), 0, true)?;
                 if side {
                     st.wait_event(&join)?;
                 } else {
-                    iq.decode(st, members, &s1, x.raw(), 2048, rows, o3.raw(), true)?;
+                    iq.decode(st, members, &s1, x.raw(), 2048, rows, o3.raw(), 0, true)?;
                 }
                 evs[2 * i + 1].record(st)?;
             }

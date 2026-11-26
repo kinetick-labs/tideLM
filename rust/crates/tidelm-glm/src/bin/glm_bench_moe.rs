@@ -15,7 +15,13 @@ use tidelm_cuda::{DeviceBuffer, Event, Stream};
 use tidelm_glm::Result;
 use tidelm_kernels::exl3::*;
 
-const POOL: usize = 128;
+// POOL=n: the expert pool (default 128); FLASH=1: GLM-5.3-Flash's shapes (H 4096, inter 2048, 288 experts)
+fn pool() -> usize {
+    std::env::var("POOL").ok().and_then(|v| v.parse().ok()).unwrap_or(if flash() { 288 } else { 128 })
+}
+fn flash() -> bool {
+    std::env::var("FLASH").is_ok()
+}
 const TOPK: usize = 8;
 
 fn main() -> Result<()> {
@@ -24,21 +30,21 @@ fn main() -> Result<()> {
     // BITS=2..4: the trellis width (default 3): equal times at every width mean the decode math, not
     // the bytes, bounds the call
     let bits: usize = std::env::var("BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let (h, il, kd, dn) = (6144usize, 1024usize, 2048usize, 3072usize);
+    let (h, il, kd, dn) = if flash() { (4096usize, 2048usize, 2048usize, 4096usize) } else { (6144usize, 1024usize, 2048usize, 3072usize) };
     let words = |k: usize, n: usize| (k / 16) * (n / 16) * 8 * bits;
     let mut seed = 0x9E3779B97F4A7C15u64;
     let mut rnd = |n: usize| -> Vec<u32> {
         (0..n).map(|_| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 }).collect()
     };
     let (wgu, wdn) = (words(h, il), words(kd, dn));
-    let t1 = DeviceBuffer::<u32>::from_slice(&rnd(POOL * wgu))?;
-    let t3 = DeviceBuffer::<u32>::from_slice(&rnd(POOL * wgu))?;
-    let t2 = DeviceBuffer::<u32>::from_slice(&rnd(POOL * wdn))?;
+    let t1 = DeviceBuffer::<u32>::from_slice(&rnd(pool() * wgu))?;
+    let t3 = DeviceBuffer::<u32>::from_slice(&rnd(pool() * wgu))?;
+    let t2 = DeviceBuffer::<u32>::from_slice(&rnd(pool() * wdn))?;
     let ptrs = |b: &DeviceBuffer<u32>, w: usize| -> Result<DeviceBuffer<i64>> {
-        Ok(DeviceBuffer::from_slice(&(0..POOL).map(|e| b.ptr_at(e * w) as i64).collect::<Vec<_>>())?)
+        Ok(DeviceBuffer::from_slice(&(0..pool()).map(|e| b.ptr_at(e * w) as i64).collect::<Vec<_>>())?)
     };
     let (t1p, t3p, t2p) = (ptrs(&t1, wgu)?, ptrs(&t3, wgu)?, ptrs(&t2, wdn)?);
-    let k2 = DeviceBuffer::from_slice(&vec![2 * bits as i32; POOL])?;
+    let k2 = DeviceBuffer::from_slice(&vec![2 * bits as i32; pool()])?;
     let pmax = 8 * TOPK;
     let x0 = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; pmax * h])?;
     let x1 = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; pmax * h])?;
@@ -66,14 +72,14 @@ fn main() -> Result<()> {
                     }
                     let mut ts = vec![];
                     for i in 0..14 {
-                        // U experts no call in the last POOL / U calls used; row j's picks overlap
+                        // U experts no call in the last pool() / U calls used; row j's picks overlap
                         let base = call * u;
                         call += 1;
-                        let picks: Vec<i32> = (0..p).map(|q| ((base + q % u) % POOL) as i32).collect();
+                        let picks: Vec<i32> = (0..p).map(|q| ((base + q % u) % pool()) as i32).collect();
                         pick.upload(&picks)?;
                         unsafe {
                             exl3m_group(pick.raw(), uids.raw(), ucount.raw(), members.raw(), r as i32, TOPK as i32,
-                                        POOL as i32, MAX_MEMBERS, st.raw());
+                                        pool() as i32, MAX_MEMBERS, st.raw());
                         }
                         e0.record(&st)?;
                         unsafe {
@@ -106,7 +112,7 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
            (h, il, kd, dn): (usize, usize, usize, usize), (wgu, wdn): (usize, usize), e0: &Event, e1: &Event) -> Result<()> {
     use tidelm_kernels::ds41::{ds_route_blocks, ds_route_large};
     use tidelm_kernels::glm::{glm_count_live, glm_member_codes};
-    let rows = 2048usize;
+    let rows: usize = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
     let p = rows * TOPK;
     let mut seed = 0x2545F4914F6CDD1Du64;
     let picks: Vec<i32> = (0..rows).flat_map(|_| {
@@ -115,7 +121,7 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            let e = (seed % POOL as u64) as i32;
+            let e = (seed % pool() as u64) as i32;
             if !row.contains(&e) {
                 row.push(e);
             }
@@ -123,13 +129,13 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
         row
     }).collect();
     let pick = DeviceBuffer::<i32>::from_slice(&picks)?;
-    let nb = unsafe { ds_route_blocks(p as i32, POOL as i32, 64) } as usize;
-    let work = DeviceBuffer::<i32>::new(3 * POOL + 64)?;
+    let nb = unsafe { ds_route_blocks(p as i32, pool() as i32, 64) } as usize;
+    let work = DeviceBuffer::<i32>::new(3 * pool() + 64)?;
     let (bslot, bpair, broute) = (DeviceBuffer::<i32>::new(nb)?, DeviceBuffer::<i32>::new(nb * 64)?, DeviceBuffer::<i32>::new(nb * 64)?);
     let members = DeviceBuffer::<i32>::new(nb * 64)?;
     let ucount = DeviceBuffer::<i32>::new(1)?;
     let ok = |rc: i32, what: &str| if rc == 0 { Ok(()) } else { Err(format!("{what}: {rc}")) };
-    ok(unsafe { ds_route_large(st.raw(), pick.raw(), p as i32, TOPK as i32, POOL as i32, work.raw(), bslot.raw(), bpair.raw(),
+    ok(unsafe { ds_route_large(st.raw(), pick.raw(), p as i32, TOPK as i32, pool() as i32, work.raw(), bslot.raw(), bpair.raw(),
                                broute.raw(), 64) }, "route")?;
     ok(unsafe { glm_member_codes(st.raw(), bpair.raw(), (nb * 64) as i32, TOPK as i32, members.raw()) }, "members")?;
     ok(unsafe { glm_count_live(st.raw(), bslot.raw(), nb as i32, ucount.raw()) }, "live")?;
@@ -142,7 +148,7 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
     let xd = DeviceBuffer::<u16>::from_slice(&hv(p * kd))?;
     let zup = DeviceBuffer::<f32>::new(2 * p * il)?;
     let zd = DeviceBuffer::<f32>::new(p * dn)?;
-    println!("prefill expert GEMM, {rows} rows x top-{TOPK} over {POOL} experts (median of 8, ms / GB/s of trellis bytes)");
+    println!("prefill expert GEMM, {rows} rows x top-{TOPK} over {} experts (median of 8, ms / GB/s of trellis bytes)", pool());
     // the shipped mul1 2-3-bit tile, then exl3m_prefill_smem_cb (mixed widths, up to 4 bits) on the same
     // 3-bit experts in both codebooks
     // the fat tile (exl3m_prefill_fat) against smem_cb mul1 on the same words: CHECK=1 compares every byte
@@ -150,9 +156,9 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
     let zref_up = DeviceBuffer::<f32>::new(2 * p * il)?;
     let zref_dn = DeviceBuffer::<f32>::new(p * dn)?;
     // the fused gate/up epilogue (exl3m_prefill_fat_gateup) against smem_cb + exl3m_gateup, on random scales
-    let svh_g = DeviceBuffer::<u16>::from_slice(&hv(POOL * il))?;
-    let svh_u = DeviceBuffer::<u16>::from_slice(&hv(POOL * il))?;
-    let suh_d = DeviceBuffer::<u16>::from_slice(&hv(POOL * kd))?;
+    let svh_g = DeviceBuffer::<u16>::from_slice(&hv(pool() * il))?;
+    let svh_u = DeviceBuffer::<u16>::from_slice(&hv(pool() * il))?;
+    let suh_d = DeviceBuffer::<u16>::from_slice(&hv(pool() * kd))?;
     let xd_ref = DeviceBuffer::<u16>::new(p * il)?;
     let xd_fat = DeviceBuffer::<u16>::new(p * il)?;
     {
@@ -165,7 +171,7 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
                                       members.raw(), zup.raw(), h as i32, il as i32, p as i32, TOPK as i32, nb as i32, 2, CB_MUL1, 8,
                                       st.raw());
                 exl3m_gateup(zup.raw(), pick.raw(), svh_g.raw(), svh_u.raw(), suh_d.raw(), xd_ref.raw(), rows as i32, p as i32,
-                             il as i32, 1, TOPK as i32, POOL as i32, kd as i32, f32::INFINITY, 1, st.raw());
+                             il as i32, 1, TOPK as i32, pool() as i32, kd as i32, f32::INFINITY, 1, st.raw());
             }
             e1.record(st)?;
             e1.synchronize()?;
@@ -208,6 +214,9 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
         println!("  differing rows {} (first {:?}), 128-col blocks {:?}", rows.len(), rows.iter().take(6).collect::<Vec<_>>(), cols);
     }
     for kernel in ["smem_mode (3-bit mul1)", "smem_cb mul1", "fat mul1", "smem_cb mcg", "fat mcg"] {
+        if std::env::var("ONLY_FAT").is_ok() && !(kernel.starts_with("fat mul1") || (check && kernel == "smem_cb mul1")) {
+            continue;
+        }
         if kernel.starts_with("smem_mode") && std::env::var("BITS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3) != 3 {
             continue; // built for 2-3-bit trellis only
         }
@@ -249,7 +258,7 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
             }
             ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let ms = ts[ts.len() / 2];
-            let bytes = (POOL * mats as usize * wq * 4) as f64;
+            let bytes = (pool() * mats as usize * wq * 4) as f64;
             println!("{kernel:>24} {name:>7}: {ms:.2} ms, {:.0} GB/s", bytes / ms / 1e6);
         }
     }

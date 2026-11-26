@@ -4,6 +4,7 @@ members = [
     "crates/tidelm-core",
     "crates/tidelm-cuda",
     "crates/tidelm-kernels",
+    "crates/tidelm-dflash",
     "crates/tidelm-model",
     "crates/tidelm-text",
     "crates/tidelm-engine",

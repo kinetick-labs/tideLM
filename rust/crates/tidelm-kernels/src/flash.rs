@@ -24,6 +24,13 @@ extern "C" {
                            slot_stride: i64, lanes: *const c_void, nl: c_int, meta: *const c_void, y: *mut c_void, ldy: i64,
                            save_k: *mut c_void, save_g: *mut c_void, save_v: *mut c_void, save_b: *mut c_void,
                            save_lane: i64, r: c_int, hl: c_int) -> c_int;
+    /// flash_kda_chain with the pass's row count: a one-lane prefill runs in three phases (bit for bit)
+    pub fn flash_kda_chain_t(stream: CudaStream, qkv: *const c_void, ldq: i64, dl: c_int, f: *const c_void, ldf: i64,
+                             b: *const c_void, ldb: i64, gt: *const c_void, ldg: i64, a_log: *const c_void,
+                             dt_bias: *const c_void, onorm: *const c_void, lower: f32, eps: f32, state: *mut c_void,
+                             slot_stride: i64, lanes: *const c_void, nl: c_int, meta: *const c_void, y: *mut c_void, ldy: i64,
+                             save_k: *mut c_void, save_g: *mut c_void, save_v: *mut c_void, save_b: *mut c_void,
+                             save_lane: i64, r: c_int, hl: c_int, t: c_int) -> c_int;
     pub fn flash_kda_replay(stream: CudaStream, state: *mut c_void, layer_stride: i64, slot_stride: i64, layers: c_int,
                             sin: c_int, sout: c_int, save_k: *const c_void, save_g: *const c_void, save_v: *const c_void,
                             save_b: *const c_void, save_layer: i64, keep: c_int, hl: c_int) -> c_int;

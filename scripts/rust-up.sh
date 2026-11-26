@@ -96,6 +96,13 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
         want GLM_HEAD exl3 exl3
         want GLM_KVB_FP8 0 1
         want GLM_EMBED_8BIT "" int8
+        # GLM_FLASH_DENSE=fp8|bf16|exl3: the non-expert weights' format. exl3 serves a checkpoint
+        # that quantises its own non-expert weights natively (docs/glm-flash.md); say it here
+        # before the ~100 GB load starts rather than after it (the engine refuses too)
+        case "${GLM_FLASH_DENSE:-fp8}" in
+            fp8|bf16|exl3) ;;
+            *) err "the Rust GLM engine reads GLM_FLASH_DENSE=fp8|bf16|exl3 only (profile: GLM_FLASH_DENSE=$GLM_FLASH_DENSE)" ;;
+        esac
     fi
     want GLM_MISS substitute substitute
     want GLM_PF 0 0
@@ -133,6 +140,9 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
           --adapt-decode "${GLM_ADAPT_DECODE_SWAPS:-256}" --bg-every "$bg" --loop-break "${GLM_LOOP_BREAK:-0}"
           --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}"
           --preload "${GLM_PRELOAD:-0}")
+    # GLM_MOE_ROWS: prefill rows a routed-expert block (the scratch is sized for it; unset: the
+    # engine's 2048). 4096 fills the fat tile's 64-member groups twice as full (docs/prefill-pg.md)
+    [[ -n "${GLM_MOE_ROWS:-}" ]] && args+=(--moe-rows "$GLM_MOE_ROWS")
     # GLM_HOT_PREDICT=DECAY,MIN,PER_LAYER[,REACT]: async hot reads chosen by recent missed demand,
     # REACT=1 after the engine's own heaviest-miss candidates (unset: off; adapt.rs HotPredict)
     [[ -n "${GLM_HOT_PREDICT:-}" ]] && args+=(--hot-predict "$GLM_HOT_PREDICT")
@@ -168,8 +178,9 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     fi
     envs=(NCCL_PROTO=Simple GLM_REASONING_EFFORT="${GLM_REASONING_EFFORT:-medium}"
           GLM_DEFAULT_MAX_TOKENS="${GLM_DEFAULT_MAX_TOKENS:-4096}")
-    # GLM-5.3-Flash's non-expert weights: fp8 (32 x 32 block scales, the default) or bf16 (the
-    # checkpoint's); it moves values, so the boot guard hashes it
+    # GLM-5.3-Flash's non-expert weights: GLM_FLASH_DENSE=fp8 (32 x 32 block scales, the default),
+    # bf16 (the checkpoint's) or exl3 (a checkpoint that quantises its own non-expert weights,
+    # docs/glm-flash.md); it moves values, so the boot guard hashes it
     [[ -n "${GLM_FLASH_DENSE:-}" ]] && envs+=(GLM_FLASH_DENSE="$GLM_FLASH_DENSE")
     # the sampler's defaults when a request names none (unset: generation_config.json's, else 1)
     [[ -n "${GLM_TEMPERATURE:-}" ]] && envs+=(GLM_TEMPERATURE="$GLM_TEMPERATURE")
@@ -335,7 +346,7 @@ fi
 # TIDELM_GLM_HOT_TRACE: GLM, rank 0 appends every decode pass's routing table and async hot reads to
 # this path (in a mounted directory), for tools/glm_hot_sim.py
 for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG TIDELM_PDL \
-         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT TIDELM_GLM_HOT_TRACE TIDELM_GLM_VERIFY_PLAN TIDELM_GLM_ACT_PLAN TIDELM_GLM_PREFILL_CHECK TIDELM_GLM_HOT_ORACLE TIDELM_FLASH_HC_FUSED TIDELM_FLASH_PF TIDELM_FLASH_PF_O TIDELM_FLASH_PF_SH TIDELM_GLM_STAGE_LOG; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT TIDELM_GLM_HOT_TRACE TIDELM_GLM_VERIFY_PLAN TIDELM_GLM_ACT_PLAN TIDELM_GLM_PREFILL_CHECK TIDELM_GLM_HOT_ORACLE TIDELM_FLASH_HC_FUSED TIDELM_FLASH_PF TIDELM_FLASH_PF_O TIDELM_FLASH_PF_SH TIDELM_GLM_STAGE_LOG TIDELM_GLM_MTP_FAT EXL3_ROT4 TIDELM_KDA3 TIDELM_FP8_GU TIDELM_MLA_LOOP TIDELM_HC_FUSE EXL3_ROTW TIDELM_SKINNY_TALL TIDELM_GEMM_TUNE TIDELM_GEMM_TUNE_LOG TIDELM_TIGHT_GRID TIDELM_MLA_FP8K; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done

@@ -34,6 +34,7 @@ fn main() {
     let flash_src = manifest.join("cuda/flash.cu");
     let inkling_src = manifest.join("cuda/inkling.cu");
     let inkling_draft_src = manifest.join("cuda/inkling_draft.cu");
+    let dflash_src = manifest.join("cuda/dflash.cu");
     let exl3_src = repo.join("tools/exl3_moe_cuda.cu");
     println!("cargo:rerun-if-changed={}", ds41_src.display());
     println!("cargo:rerun-if-changed={}", vision_src.display());
@@ -41,6 +42,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", flash_src.display());
     println!("cargo:rerun-if-changed={}", inkling_src.display());
     println!("cargo:rerun-if-changed={}", inkling_draft_src.display());
+    println!("cargo:rerun-if-changed={}", dflash_src.display());
     println!("cargo:rerun-if-changed={}", exl3_src.display());
     // TIDELM_EXL3_STREAM=1: the EXL3 kernels' trellis loads evict-first (a benchmark switch)
     println!("cargo:rerun-if-env-changed=TIDELM_EXL3_STREAM");
@@ -111,7 +113,7 @@ fn main() {
     // convolutions, block residual and grouped-query attention; inkling.o is objs[3], its drafter's
     // kernels (inkling_draft.o) objs[4]
     for (src, name) in [(&glm_src, "glm.o"), (&exl3_src, "exl3_moe_cuda.o"), (&flash_src, "flash.o"), (&inkling_src, "inkling.o"),
-                        (&inkling_draft_src, "inkling_draft.o")] {
+                        (&inkling_draft_src, "inkling_draft.o"), (&dflash_src, "dflash.o")] {
         let obj = out.join(name);
         run(Command::new(&nvcc).args(if stream { &["-DEXL3_STREAM=1"][..] } else { &[][..] }).args([
             "-std=c++17",
@@ -155,6 +157,7 @@ fn main() {
         objs[2].to_str().unwrap(),
         objs[3].to_str().unwrap(),
         objs[4].to_str().unwrap(),
+        objs[5].to_str().unwrap(),
     ]));
 
     println!("cargo:rustc-link-search=native={}", out.display());

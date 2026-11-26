@@ -18,6 +18,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <utility>
 
 __device__ __forceinline__ void pdl_enter() {
@@ -95,6 +96,63 @@ __global__ void kda_conv_kernel(const bf16* __restrict__ raw, int64_t ldr, const
     }
     out[(int64_t)t * ldo + c] = to_bf(acc / (1.f + expf(-acc)));
     if (save_raw && i < R) save_raw[(int64_t)meta[4 * z] * save_lane + (int64_t)i * C + c] = raw[(int64_t)t * ldr + c];
+}
+
+// kda_conv_kernel for one lane with nothing saved (prefill-pg): a thread 8 columns (16-byte loads) x
+// KCR consecutive rows, each raw row read once into a sliding window instead of four times; every
+// output's arithmetic is kda_conv_kernel's.
+constexpr int KCR = 8;
+__global__ void __launch_bounds__(256) kda_conv8_kernel(const bf16* __restrict__ raw, int64_t ldr, const bf16* __restrict__ w,
+                                                        int C, const bf16* __restrict__ conv, int64_t slot_stride,
+                                                        const int* __restrict__ lanes, const int* __restrict__ meta,
+                                                        bf16* __restrict__ out, int64_t ldo) {
+    pdl_enter();
+    const int c8 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c8 * 8 >= C) return;
+    const int c = c8 * 8;
+    const int row0 = lanes[0], n = lanes[1];
+    const int i0 = blockIdx.y * KCR;
+    if (i0 >= n) return;
+    const bf16* cs = conv + (int64_t)meta[1] * slot_stride;
+    float wv[8][4];
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+        const uint4 u = *reinterpret_cast<const uint4*>(w + (int64_t)c * 4 + q * 16);
+        const uint4 u2 = *reinterpret_cast<const uint4*>(w + (int64_t)c * 4 + q * 16 + 8);
+        const bf16* e = reinterpret_cast<const bf16*>(&u);
+        const bf16* e2 = reinterpret_cast<const bf16*>(&u2);
+#pragma unroll
+        for (int x = 0; x < 8; ++x) wv[q * 4 + x / 4][x % 4] = bf(e[x]);
+#pragma unroll
+        for (int x = 0; x < 8; ++x) wv[q * 4 + 2 + x / 4][x % 4] = bf(e2[x]);
+    }
+    auto load = [&](int j, float (&v)[8]) {      // raw row j of the lane (j < 0: the conv state)
+        const uint4 u = j >= 0 ? *reinterpret_cast<const uint4*>(raw + (int64_t)(row0 + j) * ldr + c)
+                               : *reinterpret_cast<const uint4*>(cs + (int64_t)(3 + j) * C + c);
+        const bf16* e = reinterpret_cast<const bf16*>(&u);
+#pragma unroll
+        for (int x = 0; x < 8; ++x) v[x] = bf(e[x]);
+    };
+    float win[4][8];
+    load(i0 - 3, win[0]);
+    load(i0 - 2, win[1]);
+    load(i0 - 1, win[2]);
+#pragma unroll
+    for (int r = 0; r < KCR; ++r) {
+        const int i = i0 + r;
+        if (i >= n) break;
+        load(i, win[(r + 3) & 3]);
+        uint4 o;
+        bf16* oe = reinterpret_cast<bf16*>(&o);
+#pragma unroll
+        for (int x = 0; x < 8; ++x) {
+            float acc = 0.f;
+#pragma unroll
+            for (int tau = 0; tau < 4; ++tau) acc = fmaf(wv[x][tau], win[(r + tau) & 3][x], acc);
+            oe[x] = to_bf(acc / (1.f + expf(-acc)));
+        }
+        *reinterpret_cast<uint4*>(out + (int64_t)(row0 + i) * ldo + c) = o;
+    }
 }
 
 // The conv state after the pass: the last 3 raw rows of [state; the group's rows], into the slot
@@ -280,6 +338,237 @@ __global__ void __launch_bounds__(kD * SP) kda_chain_kernel(
     }
 #pragma unroll
     for (int j = 0; j < KS; ++j) sout[(k0 + j) * kD + v] = S[j];
+}
+
+// ------------------------------------------------------------------ KDA prefill (prefill-pg)
+// kda_chain_kernel spends a row ~1.5 us of mostly barriers: two block reductions (the q / k norms,
+// the output's RMS) and a broadcast, five __syncthreads a row, all on the serial chain. Only the
+// delta rule itself needs the state.
+// KDA prefill for one lane (T > 64 rows), kda_chain's math in two kernels:
+//   kda_vsplit: the delta rule, one block a (head, 1/VS of the value columns) - the columns are
+//     independent; 128 half-head blocks, two an SM, balance the 48 SMs better than 64 whole heads
+//     at one an SM (the delta rule is bound by shared-memory reads of k / exp(g) / q).
+//     kD / VS * SP compute threads run kda_step over KR-row tiles staged in shared memory while KP
+//     producer warps stage the next tile (k / q norms, exp(g), beta: a warp a row, its four 32-wide
+//     sums added in kda_chain's block_sum2 order). o = bf16(S q) goes to y.
+//   kda_onorm_w: the gated RMS norm of y in place, a warp a (row, head), kda_chain's sum order.
+// Bit-identical to kda_chain (y and the state).
+#ifndef KDA_KR
+#define KDA_KR 8
+#endif
+#ifndef KDA_KP
+#define KDA_KP 2
+#endif
+#ifndef KDA_MINB
+#define KDA_MINB 2
+#endif
+#ifndef KDA_VS
+#define KDA_VS 2
+#endif
+#ifndef KDA_VPT
+#define KDA_VPT 2
+#endif
+constexpr int KR = KDA_KR, KP = KDA_KP, KVS = KDA_VS, KVPT = KDA_VPT;
+
+// kda_step for VPT value columns at once (thread's columns share k): each column's operations and
+// their order exactly kda_step's; the shared loads of k / exp(g) serve all VPT columns.
+template <int SP, int VPT>
+__device__ __forceinline__ void kda_step_v(float (&S)[VPT][kD / SP], const float* kk, const float* gg, const float (&vv)[VPT],
+                                           float beta) {
+    constexpr int KS = kD / SP;
+    float a[VPT][4];
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) a[i][0] = a[i][1] = a[i][2] = a[i][3] = 0.f;
+#pragma unroll
+    for (int j = 0; j < KS; j += 4) {
+        const float4 g4 = *reinterpret_cast<const float4*>(gg + j);
+        const float4 k4 = *reinterpret_cast<const float4*>(kk + j);
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+            S[i][j] = S[i][j] * g4.x;
+            S[i][j + 1] = S[i][j + 1] * g4.y;
+            S[i][j + 2] = S[i][j + 2] * g4.z;
+            S[i][j + 3] = S[i][j + 3] * g4.w;
+            a[i][0] = fmaf(S[i][j], k4.x, a[i][0]);
+            a[i][1] = fmaf(S[i][j + 1], k4.y, a[i][1]);
+            a[i][2] = fmaf(S[i][j + 2], k4.z, a[i][2]);
+            a[i][3] = fmaf(S[i][j + 3], k4.w, a[i][3]);
+        }
+    }
+    float delta[VPT];
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) {
+        float kv = (a[i][0] + a[i][1]) + (a[i][2] + a[i][3]);
+#pragma unroll
+        for (int o = 1; o < SP; o <<= 1) kv += __shfl_xor_sync(0xffffffffu, kv, o);
+        delta[i] = (vv[i] - kv) * beta;
+    }
+#pragma unroll
+    for (int j = 0; j < KS; j += 4) {
+        const float4 k4 = *reinterpret_cast<const float4*>(kk + j);
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+            S[i][j] = fmaf(k4.x, delta[i], S[i][j]);
+            S[i][j + 1] = fmaf(k4.y, delta[i], S[i][j + 1]);
+            S[i][j + 2] = fmaf(k4.z, delta[i], S[i][j + 2]);
+            S[i][j + 3] = fmaf(k4.w, delta[i], S[i][j + 3]);
+        }
+    }
+}
+
+template <int SP>
+__global__ void __launch_bounds__(kD / KVS / KVPT * SP + 32 * KP, KDA_MINB) kda_vsplit_kernel(
+    const bf16* __restrict__ qkv, int64_t ldq, int dl, const bf16* __restrict__ f, int64_t ldf, const bf16* __restrict__ b,
+    int64_t ldb, const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower, float* __restrict__ state,
+    int64_t slot_stride, const int* __restrict__ lanes, const int* __restrict__ meta, bf16* __restrict__ y, int64_t ldy) {
+    pdl_enter();
+    constexpr int KS = kD / SP, NT = kD / KVS / KVPT * SP, VB = kD / KVS / KVPT;
+    // a row's k / q / exp(g) with each thread group's KS keys 4 floats further on: the SP groups of a
+    // warp read their own KS-run at once, which unpadded (KS x 4 bytes apart) hit the same banks
+    constexpr int KP4 = kD + 4 * (SP - 1);
+    __shared__ __align__(16) float sk[2][KR][KP4], sq[2][KR][KP4], sg[2][KR][KP4];
+    __shared__ __align__(16) bf16 sv[2][KR][kD];
+    __shared__ float sb[2][KR];
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const int n = lanes[1];
+    if (n <= 0) return;
+    const int64_t t0 = lanes[0];
+    const int tiles = (n + KR - 1) / KR;
+    const bool prod = tid >= NT;
+    const int pw = (tid - NT) >> 5, l = tid & 31;
+    const int v = blockIdx.y * (kD / KVS) + tid / SP, k0 = (tid % SP) * KS;  // columns v + i VB
+
+    auto prep = [&](int buf, int tile) {
+        const float rate = expf(a_log[h]);
+        const int rows = min(KR, n - tile * KR);
+        for (int r = pw; r < rows; r += KP) {
+            const int64_t t = t0 + tile * KR + r;
+            const bf16* row = qkv + t * ldq + h * kD;
+            float qv[4], kv[4], fv[4], dv[4];
+            bf16 vv[4];
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const int e = 32 * g + l;
+                qv[g] = bf(row[e]);
+                kv[g] = bf(row[dl + e]);
+                vv[g] = row[2 * dl + e];
+                fv[g] = bf(f[t * ldf + h * kD + e]);
+                dv[g] = dt_bias[h * kD + e];
+            }
+            const float beta = rbf(sigmoidf_(bf(b[t * ldb + h])));
+            float sx = warp_sum(kv[0] * kv[0]), sy_ = warp_sum(qv[0] * qv[0]);
+#pragma unroll
+            for (int g = 1; g < 4; ++g) {
+                sx += warp_sum(kv[g] * kv[g]);
+                sy_ += warp_sum(qv[g] * qv[g]);
+            }
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const int e = 32 * g + l;
+                const float kn = kv[g] / sqrtf(sx + 1e-6f);
+                const float qn = qv[g] / sqrtf(sy_ + 1e-6f) * 0.08838834764831845f;
+                const float gg = lower * sigmoidf_(rate * (fv[g] + dv[g]));
+                const int ep = e + 4 * (e / KS);
+                sk[buf][r][ep] = kn;
+                sq[buf][r][ep] = qn;
+                sg[buf][r][ep] = expf(gg);
+                sv[buf][r][e] = vv[g];
+            }
+            if (l == 0) sb[buf][r] = beta;
+        }
+    };
+
+    float S[KVPT][KS];
+    if (!prod) {
+        const float* sin = state + (int64_t)meta[1] * slot_stride + (int64_t)h * kD * kD;
+#pragma unroll
+        for (int i = 0; i < KVPT; ++i)
+#pragma unroll
+            for (int j = 0; j < KS; ++j) S[i][j] = sin[(k0 + j) * kD + v + i * VB];
+    } else {
+        prep(0, 0);
+    }
+    __syncthreads();
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int buf = tile & 1;
+        if (!prod) {
+            const int rows = min(KR, n - tile * KR);
+            for (int r = 0; r < rows; ++r) {
+                const int kp = k0 + 4 * (k0 / KS);
+                float vv[KVPT];
+#pragma unroll
+                for (int i = 0; i < KVPT; ++i) vv[i] = bf(sv[buf][r][v + i * VB]);
+                kda_step_v<SP, KVPT>(S, &sk[buf][r][kp], &sg[buf][r][kp], vv, sb[buf][r]);
+                const float* qq = &sq[buf][r][kp];
+                float o[KVPT][4];
+#pragma unroll
+                for (int i = 0; i < KVPT; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+#pragma unroll
+                for (int j = 0; j < KS; j += 4) {
+                    const float4 q4 = *reinterpret_cast<const float4*>(qq + j);
+#pragma unroll
+                    for (int i = 0; i < KVPT; ++i) {
+                        o[i][0] = fmaf(S[i][j], q4.x, o[i][0]);
+                        o[i][1] = fmaf(S[i][j + 1], q4.y, o[i][1]);
+                        o[i][2] = fmaf(S[i][j + 2], q4.z, o[i][2]);
+                        o[i][3] = fmaf(S[i][j + 3], q4.w, o[i][3]);
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < KVPT; ++i) {
+                    float oo = (o[i][0] + o[i][1]) + (o[i][2] + o[i][3]);
+#pragma unroll
+                    for (int x = 1; x < SP; x <<= 1) oo += __shfl_xor_sync(0xffffffffu, oo, x);
+                    if (tid % SP == 0) y[(t0 + tile * KR + r) * ldy + h * kD + v + i * VB] = to_bf(oo);
+                }
+            }
+        } else if (tile + 1 < tiles) {
+            prep(buf ^ 1, tile + 1);
+        }
+        __syncthreads();
+    }
+    if (!prod) {
+        float* sout = state + (int64_t)meta[2] * slot_stride + (int64_t)h * kD * kD;
+#pragma unroll
+        for (int i = 0; i < KVPT; ++i)
+#pragma unroll
+            for (int j = 0; j < KS; ++j) sout[(k0 + j) * kD + v + i * VB] = S[i][j];
+    }
+}
+
+// y = the gated RMS norm of o (in y), a warp a (row, head): kda_chain's block_sum2 over its kD * SP
+// threads (value v on thread SP v, NW warps) replayed group by group in one warp.
+template <int SP>
+__global__ void __launch_bounds__(256) kda_onorm_w_kernel(const bf16* __restrict__ gt, int64_t ldg, const bf16* __restrict__ onorm,
+                                                          float eps, const int* __restrict__ lanes, int hl, bf16* __restrict__ y,
+                                                          int64_t ldy) {
+    pdl_enter();
+    constexpr int NW = kD * SP / 32;
+    const int item = blockIdx.x * 8 + (threadIdx.x >> 5), l = threadIdx.x & 31;
+    const int i = item / hl, h = item % hl;
+    if (i >= lanes[1]) return;
+    const int64_t t = lanes[0] + i;
+    bf16* yr = y + t * ldy + h * kD;
+    float ob[NW];
+    float s = 0.f;
+#pragma unroll
+    for (int w = 0; w < NW; ++w) ob[w] = bf(yr[(32 * w + l) / SP]);
+#pragma unroll
+    for (int w = 0; w < NW; ++w) {
+        const float a = warp_sum(l % SP == 0 ? ob[w] * ob[w] : 0.f);
+        s = w == 0 ? a : s + a;
+    }
+    __syncwarp();
+    if (l % SP == 0) {
+#pragma unroll
+        for (int w = 0; w < NW; ++w) {
+            const int vo = (32 * w + l) / SP;
+            float yv = ob[w] * rsqrtf(s * (1.f / kD) + eps);
+            yv = bf(onorm[vo]) * yv;
+            yv = yv * sigmoidf_(bf(gt[t * ldg + h * kD + vo]));
+            yr[vo] = to_bf(yv);
+        }
+    }
 }
 
 // A rollback for one lane over every KDA layer: the state the pass read (slot sin) through its first
@@ -776,6 +1065,15 @@ int flash_kda_conv(void* stream, const void* raw, int64_t ldr, const void* w, in
                    const void* lanes, int nl, const void* meta, int T, void* out, int64_t ldo, void* save_raw,
                    int64_t save_lane, int R) {
     if (nl < 1 || C % 8) return (int)cudaErrorInvalidValue;
+    static int c8 = -1;
+    if (c8 < 0) { const char* e = getenv("TIDELM_KDA3"); c8 = !(e && e[0] == '0'); }
+    if (c8 && nl == 1 && !save_raw && T > 64 && ((uintptr_t)raw & 15) == 0 && ((uintptr_t)out & 15) == 0 &&
+        ((uintptr_t)conv & 15) == 0 && ((uintptr_t)w & 15) == 0 && ldr % 8 == 0 && ldo % 8 == 0 && slot_stride % 8 == 0) {
+        pdl_launch(kda_conv8_kernel, dim3((C / 8 + 255) / 256, (T + KCR - 1) / KCR), 256, 0, GST, static_cast<const bf16*>(raw),
+                   ldr, static_cast<const bf16*>(w), C, static_cast<const bf16*>(conv), slot_stride, static_cast<const int*>(lanes),
+                   static_cast<const int*>(meta), static_cast<bf16*>(out), ldo);
+        GRET;
+    }
     pdl_launch(kda_conv_kernel, dim3((C + 255) / 256, T), 256, 0, GST, static_cast<const bf16*>(raw), ldr,
                static_cast<const bf16*>(w), C, static_cast<const bf16*>(conv), slot_stride, static_cast<const int*>(lanes), nl,
                static_cast<const int*>(meta), static_cast<bf16*>(out), ldo, static_cast<bf16*>(save_raw), save_lane, R);
@@ -811,6 +1109,33 @@ int flash_kda_chain(void* stream, const void* qkv, int64_t ldq, int dl, const vo
     };
     if (g_kda_split == 4) go(kda_chain_kernel<4>, 4);
     else go(kda_chain_kernel<2>, 2);
+    GRET;
+}
+
+// kda_chain in three phases for a prefill (prefill-pg): one lane, no saved rows, T rows; else the
+// chain kernel. TIDELM_KDA3=0: always the chain. Bit for bit the chain's y and state.
+int flash_kda_chain_t(void* stream, const void* qkv, int64_t ldq, int dl, const void* f, int64_t ldf, const void* b, int64_t ldb,
+                      const void* gt, int64_t ldg, const void* a_log, const void* dt_bias, const void* onorm, float lower,
+                      float eps, void* state, int64_t slot_stride, const void* lanes, int nl, const void* meta, void* y,
+                      int64_t ldy, void* save_k, void* save_g, void* save_v, void* save_b, int64_t save_lane, int R, int hl,
+                      int T) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("TIDELM_KDA3"); on = !(e && e[0] == '0'); }
+    const bool al = ((uintptr_t)qkv & 15) == 0 && (ldq % 8) == 0 && (dl % 8) == 0;
+    if (!on || nl != 1 || save_k || T <= 64 || dl != hl * kD || !al)
+        return flash_kda_chain(stream, qkv, ldq, dl, f, ldf, b, ldb, gt, ldg, a_log, dt_bias, onorm, lower, eps, state,
+                               slot_stride, lanes, nl, meta, y, ldy, save_k, save_g, save_v, save_b, save_lane, R, hl);
+    const int* ln = static_cast<const int*>(lanes);
+    auto go = [&](auto scan, auto onrm, int sp) {
+        pdl_launch(scan, dim3(hl, KVS), kD / KVS / KVPT * sp + 32 * KP, 0, GST, static_cast<const bf16*>(qkv), ldq, dl,
+                   static_cast<const bf16*>(f), ldf, static_cast<const bf16*>(b), ldb, static_cast<const float*>(a_log),
+                   static_cast<const float*>(dt_bias), lower, static_cast<float*>(state), slot_stride, ln,
+                   static_cast<const int*>(meta), static_cast<bf16*>(y), ldy);
+        pdl_launch(onrm, dim3((T * hl + 7) / 8), 256, 0, GST, static_cast<const bf16*>(gt), ldg, static_cast<const bf16*>(onorm),
+                   eps, ln, hl, static_cast<bf16*>(y), ldy);
+    };
+    if (g_kda_split == 4) go(kda_vsplit_kernel<4>, kda_onorm_w_kernel<4>, 4);
+    else go(kda_vsplit_kernel<2>, kda_onorm_w_kernel<2>, 2);
     GRET;
 }
 

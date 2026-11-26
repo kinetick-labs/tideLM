@@ -80,6 +80,17 @@ impl Blas {
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_rm_batched(&self, m: usize, n: usize, k: usize, x: Mat, sx: i64, w: Mat, sw: i64, w_t: bool,
                            y: *mut c_void, y_ty: c_int, ldy: i64, sy: i64, batch: usize) -> Result<(), String> {
+        // prefill-pg: at prefill sizes a cublasGemmEx a head beats the strided-batched kernel cuBLAS picks
+        // (cutlass wmma 32x32) and gives the same bits; TIDELM_MLA_LOOP=0 keeps the batched call.
+        let two = |t: c_int| t == R_16BF || t == R_16F;
+        if m >= 1024 && two(x.ty) && two(w.ty) && two(y_ty) && mla_loop() {
+            for b in 0..batch as i64 {
+                let off = |p: *const c_void, s: i64| unsafe { (p as *const u8).offset((b * s * 2) as isize) as *const c_void };
+                self.gemm_rm(m, n, k, Mat { ptr: off(x.ptr, sx), ..x }, Mat { ptr: off(w.ptr, sw), ..w }, w_t,
+                             off(y, sy) as *mut c_void, y_ty, ldy)?;
+            }
+            return Ok(());
+        }
         let (alpha, beta) = (1f32, 0f32);
         let transa = if w_t { OP_T } else { OP_N };
         ck(unsafe {
@@ -89,6 +100,11 @@ impl Blas {
                                        ldy as c_int, sy, batch as c_int, COMPUTE_32F, GEMM_DEFAULT)
         }, "batched gemm")
     }
+}
+
+fn mla_loop() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TIDELM_MLA_LOOP").map(|v| v != "0").unwrap_or(true))
 }
 
 impl Drop for Blas {

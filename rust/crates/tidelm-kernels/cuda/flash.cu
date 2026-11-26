@@ -98,6 +98,63 @@ __global__ void kda_conv_kernel(const bf16* __restrict__ raw, int64_t ldr, const
     if (save_raw && i < R) save_raw[(int64_t)meta[4 * z] * save_lane + (int64_t)i * C + c] = raw[(int64_t)t * ldr + c];
 }
 
+// kda_conv_kernel for one lane with nothing saved (prefill-pg): a thread 8 columns (16-byte loads) x
+// KCR consecutive rows, each raw row read once into a sliding window instead of four times; every
+// output's arithmetic is kda_conv_kernel's.
+constexpr int KCR = 8;
+__global__ void __launch_bounds__(256) kda_conv8_kernel(const bf16* __restrict__ raw, int64_t ldr, const bf16* __restrict__ w,
+                                                        int C, const bf16* __restrict__ conv, int64_t slot_stride,
+                                                        const int* __restrict__ lanes, const int* __restrict__ meta,
+                                                        bf16* __restrict__ out, int64_t ldo) {
+    pdl_enter();
+    const int c8 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c8 * 8 >= C) return;
+    const int c = c8 * 8;
+    const int row0 = lanes[0], n = lanes[1];
+    const int i0 = blockIdx.y * KCR;
+    if (i0 >= n) return;
+    const bf16* cs = conv + (int64_t)meta[1] * slot_stride;
+    float wv[8][4];
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+        const uint4 u = *reinterpret_cast<const uint4*>(w + (int64_t)c * 4 + q * 16);
+        const uint4 u2 = *reinterpret_cast<const uint4*>(w + (int64_t)c * 4 + q * 16 + 8);
+        const bf16* e = reinterpret_cast<const bf16*>(&u);
+        const bf16* e2 = reinterpret_cast<const bf16*>(&u2);
+#pragma unroll
+        for (int x = 0; x < 8; ++x) wv[q * 4 + x / 4][x % 4] = bf(e[x]);
+#pragma unroll
+        for (int x = 0; x < 8; ++x) wv[q * 4 + 2 + x / 4][x % 4] = bf(e2[x]);
+    }
+    auto load = [&](int j, float (&v)[8]) {      // raw row j of the lane (j < 0: the conv state)
+        const uint4 u = j >= 0 ? *reinterpret_cast<const uint4*>(raw + (int64_t)(row0 + j) * ldr + c)
+                               : *reinterpret_cast<const uint4*>(cs + (int64_t)(3 + j) * C + c);
+        const bf16* e = reinterpret_cast<const bf16*>(&u);
+#pragma unroll
+        for (int x = 0; x < 8; ++x) v[x] = bf(e[x]);
+    };
+    float win[4][8];
+    load(i0 - 3, win[0]);
+    load(i0 - 2, win[1]);
+    load(i0 - 1, win[2]);
+#pragma unroll
+    for (int r = 0; r < KCR; ++r) {
+        const int i = i0 + r;
+        if (i >= n) break;
+        load(i, win[(r + 3) & 3]);
+        uint4 o;
+        bf16* oe = reinterpret_cast<bf16*>(&o);
+#pragma unroll
+        for (int x = 0; x < 8; ++x) {
+            float acc = 0.f;
+#pragma unroll
+            for (int tau = 0; tau < 4; ++tau) acc = fmaf(wv[x][tau], win[(r + tau) & 3][x], acc);
+            oe[x] = to_bf(acc / (1.f + expf(-acc)));
+        }
+        *reinterpret_cast<uint4*>(out + (int64_t)(row0 + i) * ldo + c) = o;
+    }
+}
+
 // The conv state after the pass: the last 3 raw rows of [state; the group's rows], into the slot
 // the lane writes.
 __global__ void kda_conv_state_kernel(const bf16* __restrict__ raw, int64_t ldr, int C, bf16* __restrict__ conv,
@@ -308,16 +365,68 @@ __global__ void __launch_bounds__(kD * SP) kda_chain_kernel(
 #ifndef KDA_VS
 #define KDA_VS 2
 #endif
-constexpr int KR = KDA_KR, KP = KDA_KP, KVS = KDA_VS;
+#ifndef KDA_VPT
+#define KDA_VPT 2
+#endif
+constexpr int KR = KDA_KR, KP = KDA_KP, KVS = KDA_VS, KVPT = KDA_VPT;
+
+// kda_step for VPT value columns at once (thread's columns share k): each column's operations and
+// their order exactly kda_step's; the shared loads of k / exp(g) serve all VPT columns.
+template <int SP, int VPT>
+__device__ __forceinline__ void kda_step_v(float (&S)[VPT][kD / SP], const float* kk, const float* gg, const float (&vv)[VPT],
+                                           float beta) {
+    constexpr int KS = kD / SP;
+    float a[VPT][4];
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) a[i][0] = a[i][1] = a[i][2] = a[i][3] = 0.f;
+#pragma unroll
+    for (int j = 0; j < KS; j += 4) {
+        const float4 g4 = *reinterpret_cast<const float4*>(gg + j);
+        const float4 k4 = *reinterpret_cast<const float4*>(kk + j);
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+            S[i][j] = S[i][j] * g4.x;
+            S[i][j + 1] = S[i][j + 1] * g4.y;
+            S[i][j + 2] = S[i][j + 2] * g4.z;
+            S[i][j + 3] = S[i][j + 3] * g4.w;
+            a[i][0] = fmaf(S[i][j], k4.x, a[i][0]);
+            a[i][1] = fmaf(S[i][j + 1], k4.y, a[i][1]);
+            a[i][2] = fmaf(S[i][j + 2], k4.z, a[i][2]);
+            a[i][3] = fmaf(S[i][j + 3], k4.w, a[i][3]);
+        }
+    }
+    float delta[VPT];
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) {
+        float kv = (a[i][0] + a[i][1]) + (a[i][2] + a[i][3]);
+#pragma unroll
+        for (int o = 1; o < SP; o <<= 1) kv += __shfl_xor_sync(0xffffffffu, kv, o);
+        delta[i] = (vv[i] - kv) * beta;
+    }
+#pragma unroll
+    for (int j = 0; j < KS; j += 4) {
+        const float4 k4 = *reinterpret_cast<const float4*>(kk + j);
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+            S[i][j] = fmaf(k4.x, delta[i], S[i][j]);
+            S[i][j + 1] = fmaf(k4.y, delta[i], S[i][j + 1]);
+            S[i][j + 2] = fmaf(k4.z, delta[i], S[i][j + 2]);
+            S[i][j + 3] = fmaf(k4.w, delta[i], S[i][j + 3]);
+        }
+    }
+}
 
 template <int SP>
-__global__ void __launch_bounds__(kD / KVS * SP + 32 * KP, KDA_MINB) kda_vsplit_kernel(
+__global__ void __launch_bounds__(kD / KVS / KVPT * SP + 32 * KP, KDA_MINB) kda_vsplit_kernel(
     const bf16* __restrict__ qkv, int64_t ldq, int dl, const bf16* __restrict__ f, int64_t ldf, const bf16* __restrict__ b,
     int64_t ldb, const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower, float* __restrict__ state,
     int64_t slot_stride, const int* __restrict__ lanes, const int* __restrict__ meta, bf16* __restrict__ y, int64_t ldy) {
     pdl_enter();
-    constexpr int KS = kD / SP, NT = kD / KVS * SP;
-    __shared__ __align__(16) float sk[2][KR][kD], sq[2][KR][kD], sg[2][KR][kD];
+    constexpr int KS = kD / SP, NT = kD / KVS / KVPT * SP, VB = kD / KVS / KVPT;
+    // a row's k / q / exp(g) with each thread group's KS keys 4 floats further on: the SP groups of a
+    // warp read their own KS-run at once, which unpadded (KS x 4 bytes apart) hit the same banks
+    constexpr int KP4 = kD + 4 * (SP - 1);
+    __shared__ __align__(16) float sk[2][KR][KP4], sq[2][KR][KP4], sg[2][KR][KP4];
     __shared__ __align__(16) bf16 sv[2][KR][kD];
     __shared__ float sb[2][KR];
     const int h = blockIdx.x, tid = threadIdx.x;
@@ -327,7 +436,7 @@ __global__ void __launch_bounds__(kD / KVS * SP + 32 * KP, KDA_MINB) kda_vsplit_
     const int tiles = (n + KR - 1) / KR;
     const bool prod = tid >= NT;
     const int pw = (tid - NT) >> 5, l = tid & 31;
-    const int v = blockIdx.y * (kD / KVS) + tid / SP, k0 = (tid % SP) * KS;
+    const int v = blockIdx.y * (kD / KVS) + tid / SP, k0 = (tid % SP) * KS;  // columns v + i VB
 
     auto prep = [&](int buf, int tile) {
         const float rate = expf(a_log[h]);
@@ -359,20 +468,23 @@ __global__ void __launch_bounds__(kD / KVS * SP + 32 * KP, KDA_MINB) kda_vsplit_
                 const float kn = kv[g] / sqrtf(sx + 1e-6f);
                 const float qn = qv[g] / sqrtf(sy_ + 1e-6f) * 0.08838834764831845f;
                 const float gg = lower * sigmoidf_(rate * (fv[g] + dv[g]));
-                sk[buf][r][e] = kn;
-                sq[buf][r][e] = qn;
-                sg[buf][r][e] = expf(gg);
+                const int ep = e + 4 * (e / KS);
+                sk[buf][r][ep] = kn;
+                sq[buf][r][ep] = qn;
+                sg[buf][r][ep] = expf(gg);
                 sv[buf][r][e] = vv[g];
             }
             if (l == 0) sb[buf][r] = beta;
         }
     };
 
-    float S[KS];
+    float S[KVPT][KS];
     if (!prod) {
         const float* sin = state + (int64_t)meta[1] * slot_stride + (int64_t)h * kD * kD;
 #pragma unroll
-        for (int j = 0; j < KS; ++j) S[j] = sin[(k0 + j) * kD + v];
+        for (int i = 0; i < KVPT; ++i)
+#pragma unroll
+            for (int j = 0; j < KS; ++j) S[i][j] = sin[(k0 + j) * kD + v + i * VB];
     } else {
         prep(0, 0);
     }
@@ -382,21 +494,33 @@ __global__ void __launch_bounds__(kD / KVS * SP + 32 * KP, KDA_MINB) kda_vsplit_
         if (!prod) {
             const int rows = min(KR, n - tile * KR);
             for (int r = 0; r < rows; ++r) {
-                kda_step<SP>(S, &sk[buf][r][k0], &sg[buf][r][k0], bf(sv[buf][r][v]), sb[buf][r]);
-                const float* qq = &sq[buf][r][k0];
-                float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+                const int kp = k0 + 4 * (k0 / KS);
+                float vv[KVPT];
+#pragma unroll
+                for (int i = 0; i < KVPT; ++i) vv[i] = bf(sv[buf][r][v + i * VB]);
+                kda_step_v<SP, KVPT>(S, &sk[buf][r][kp], &sg[buf][r][kp], vv, sb[buf][r]);
+                const float* qq = &sq[buf][r][kp];
+                float o[KVPT][4];
+#pragma unroll
+                for (int i = 0; i < KVPT; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
 #pragma unroll
                 for (int j = 0; j < KS; j += 4) {
                     const float4 q4 = *reinterpret_cast<const float4*>(qq + j);
-                    o0 = fmaf(S[j], q4.x, o0);
-                    o1 = fmaf(S[j + 1], q4.y, o1);
-                    o2 = fmaf(S[j + 2], q4.z, o2);
-                    o3 = fmaf(S[j + 3], q4.w, o3);
-                }
-                float o = (o0 + o1) + (o2 + o3);
 #pragma unroll
-                for (int x = 1; x < SP; x <<= 1) o += __shfl_xor_sync(0xffffffffu, o, x);
-                if (tid % SP == 0) y[(t0 + tile * KR + r) * ldy + h * kD + v] = to_bf(o);
+                    for (int i = 0; i < KVPT; ++i) {
+                        o[i][0] = fmaf(S[i][j], q4.x, o[i][0]);
+                        o[i][1] = fmaf(S[i][j + 1], q4.y, o[i][1]);
+                        o[i][2] = fmaf(S[i][j + 2], q4.z, o[i][2]);
+                        o[i][3] = fmaf(S[i][j + 3], q4.w, o[i][3]);
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < KVPT; ++i) {
+                    float oo = (o[i][0] + o[i][1]) + (o[i][2] + o[i][3]);
+#pragma unroll
+                    for (int x = 1; x < SP; x <<= 1) oo += __shfl_xor_sync(0xffffffffu, oo, x);
+                    if (tid % SP == 0) y[(t0 + tile * KR + r) * ldy + h * kD + v + i * VB] = to_bf(oo);
+                }
             }
         } else if (tile + 1 < tiles) {
             prep(buf ^ 1, tile + 1);
@@ -406,7 +530,9 @@ __global__ void __launch_bounds__(kD / KVS * SP + 32 * KP, KDA_MINB) kda_vsplit_
     if (!prod) {
         float* sout = state + (int64_t)meta[2] * slot_stride + (int64_t)h * kD * kD;
 #pragma unroll
-        for (int j = 0; j < KS; ++j) sout[(k0 + j) * kD + v] = S[j];
+        for (int i = 0; i < KVPT; ++i)
+#pragma unroll
+            for (int j = 0; j < KS; ++j) sout[(k0 + j) * kD + v + i * VB] = S[i][j];
     }
 }
 
@@ -939,6 +1065,15 @@ int flash_kda_conv(void* stream, const void* raw, int64_t ldr, const void* w, in
                    const void* lanes, int nl, const void* meta, int T, void* out, int64_t ldo, void* save_raw,
                    int64_t save_lane, int R) {
     if (nl < 1 || C % 8) return (int)cudaErrorInvalidValue;
+    static int c8 = -1;
+    if (c8 < 0) { const char* e = getenv("TIDELM_KDA3"); c8 = !(e && e[0] == '0'); }
+    if (c8 && nl == 1 && !save_raw && T > 64 && ((uintptr_t)raw & 15) == 0 && ((uintptr_t)out & 15) == 0 &&
+        ((uintptr_t)conv & 15) == 0 && ((uintptr_t)w & 15) == 0 && ldr % 8 == 0 && ldo % 8 == 0 && slot_stride % 8 == 0) {
+        pdl_launch(kda_conv8_kernel, dim3((C / 8 + 255) / 256, (T + KCR - 1) / KCR), 256, 0, GST, static_cast<const bf16*>(raw),
+                   ldr, static_cast<const bf16*>(w), C, static_cast<const bf16*>(conv), slot_stride, static_cast<const int*>(lanes),
+                   static_cast<const int*>(meta), static_cast<bf16*>(out), ldo);
+        GRET;
+    }
     pdl_launch(kda_conv_kernel, dim3((C + 255) / 256, T), 256, 0, GST, static_cast<const bf16*>(raw), ldr,
                static_cast<const bf16*>(w), C, static_cast<const bf16*>(conv), slot_stride, static_cast<const int*>(lanes), nl,
                static_cast<const int*>(meta), static_cast<bf16*>(out), ldo, static_cast<bf16*>(save_raw), save_lane, R);
@@ -992,7 +1127,7 @@ int flash_kda_chain_t(void* stream, const void* qkv, int64_t ldq, int dl, const 
                                slot_stride, lanes, nl, meta, y, ldy, save_k, save_g, save_v, save_b, save_lane, R, hl);
     const int* ln = static_cast<const int*>(lanes);
     auto go = [&](auto scan, auto onrm, int sp) {
-        pdl_launch(scan, dim3(hl, KVS), kD / KVS * sp + 32 * KP, 0, GST, static_cast<const bf16*>(qkv), ldq, dl,
+        pdl_launch(scan, dim3(hl, KVS), kD / KVS / KVPT * sp + 32 * KP, 0, GST, static_cast<const bf16*>(qkv), ldq, dl,
                    static_cast<const bf16*>(f), ldf, static_cast<const bf16*>(b), ldb, static_cast<const float*>(a_log),
                    static_cast<const float*>(dt_bias), lower, static_cast<float*>(state), slot_stride, ln,
                    static_cast<const int*>(meta), static_cast<bf16*>(y), ldy);

@@ -1813,6 +1813,38 @@ __global__ void __launch_bounds__(ROT_WARPS * 32) rot_in4_kernel(const TIN* __re
     st4h((mat ? out1 : out0) + (size_t)p * K + blk * 128 + 4 * lane, v);
 }
 
+// rot_in4 with a warp a pick over all of its 128-blocks and both matrices (prefill-pg): the row's x read once,
+// each warp's stores one contiguous row; the same arithmetic per element.
+template <typename TIN>
+__global__ void __launch_bounds__(256) rot_in4w_kernel(const TIN* __restrict__ x, int x_stride,
+        const int* __restrict__ pick, const half* __restrict__ suh0, const half* __restrict__ suh1,
+        half* __restrict__ out0, half* __restrict__ out1, int K, int slots, int P) {
+    pdl_enter();
+    const int p = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (p >= P) return;
+    const int e = pick[p];
+    if (e < 0) return;
+    const int row = p / slots, lane = threadIdx.x & 31;
+    const TIN* xr = x + (size_t)row * x_stride + 4 * lane;
+    const half* s0 = suh0 + (size_t)e * K + 4 * lane;
+    const half* s1 = suh1 + (size_t)e * K + 4 * lane;
+    half* o0 = out0 + (size_t)p * K + 4 * lane;
+    half* o1 = out1 + (size_t)p * K + 4 * lane;
+#pragma unroll 2
+    for (int b = 0; b < K; b += 128) {
+        float v[4], a[4], b0[4], b1[4];
+        ld4f<TIN>(xr + b, v);
+        ld4f<half>(s0 + b, b0);
+        ld4f<half>(s1 + b, b1);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { a[j] = v[j] * b1[j]; v[j] = v[j] * b0[j]; }
+        fwht128(v, lane);
+        fwht128(a, lane);
+        st4h(o0 + b, v);
+        st4h(o1 + b, a);
+    }
+}
+
 // rot_in4's rotated rows (fp16-rounded, as there) as e4m3 for the FP8 gate/up (TIDELM_FP8_GU): a block a
 // (pick, matrix), a warp a 128-block (K <= 4096); e4m3 of v / (absmax / 448) in prefill_fat_kernel<F8>'s K
 // order (each 32-chunk in the m16n8k32 A fragment's logical order), the scale in xs0 / xs1 [P].
@@ -1906,6 +1938,64 @@ __global__ void __launch_bounds__(ROT_WARPS * 32) dense_out4_kernel(const float*
         y.x = v[0] * HAD_SCALE * sv[0]; y.y = v[1] * HAD_SCALE * sv[1];
         y.z = v[2] * HAD_SCALE * sv[2]; y.w = v[3] * HAD_SCALE * sv[3];
         *reinterpret_cast<float4*>(reinterpret_cast<float*>(out) + r * ldy + n) = y;
+    }
+}
+
+// dense_rot4 / dense_out4 with a warp a row over all of its 128-blocks (prefill-pg, EXL3_ROTW=0 off): the
+// same arithmetic per element, each warp's accesses 512 contiguous columns of a row.
+template <typename TIN>
+__global__ void __launch_bounds__(256) dense_rot4w_kernel(const TIN* __restrict__ x, int x_stride,
+        const half* __restrict__ suh, half* __restrict__ out, int K, int G, int R) {
+    pdl_enter();
+    const int r = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (r >= R) return;
+    const TIN* xr = x + (size_t)r * x_stride + 4 * lane;
+    const half* sr = suh + (size_t)(r % G) * K + 4 * lane;
+    half* o = out + (size_t)r * K + 4 * lane;
+    const int b1 = min(K, (int)(blockIdx.y + 1) * 512);
+#pragma unroll 2
+    for (int b = blockIdx.y * 512; b < b1; b += 128) {
+        float v[4], sv[4];
+        ld4f<TIN>(xr + b, v);
+        ld4f<half>(sr + b, sv);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = v[j] * sv[j];
+        fwht128(v, lane);
+        st4h(o + b, v);
+    }
+}
+
+__global__ void __launch_bounds__(256) dense_out4w_kernel(const float* __restrict__ Z,
+        const half* __restrict__ svh, void* __restrict__ out, int rows, int N, int SK, int G, int out_bf16,
+        int out_stride) {
+    const size_t ldy = out_stride ? (size_t)out_stride : (size_t)N;
+    pdl_enter();
+    const int r = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (r >= rows) return;
+    const int b1 = min(N, (int)(blockIdx.y + 1) * 512);
+#pragma unroll 2
+    for (int b = blockIdx.y * 512; b < b1; b += 128) {
+        const int n = b + 4 * lane;
+        float v[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int q = 0; q < SK; ++q) {
+            const float4 z = *reinterpret_cast<const float4*>(Z + ((size_t)q * rows + r) * N + n);
+            v[0] += z.x; v[1] += z.y; v[2] += z.z; v[3] += z.w;
+        }
+        fwht128(v, lane);
+        float sv[4];
+        ld4f<half>(svh + (size_t)(r % G) * N + n, sv);
+        if (out_bf16) {
+            uint2 u;
+            __nv_bfloat16* e = reinterpret_cast<__nv_bfloat16*>(&u);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) e[j] = __float2bfloat16_rn(v[j] * HAD_SCALE * sv[j]);
+            *reinterpret_cast<uint2*>(reinterpret_cast<__nv_bfloat16*>(out) + r * ldy + n) = u;
+        } else {
+            float4 y;
+            y.x = v[0] * HAD_SCALE * sv[0]; y.y = v[1] * HAD_SCALE * sv[1];
+            y.z = v[2] * HAD_SCALE * sv[2]; y.w = v[3] * HAD_SCALE * sv[3];
+            *reinterpret_cast<float4*>(reinterpret_cast<float*>(out) + r * ldy + n) = y;
+        }
     }
 }
 
@@ -2170,10 +2260,26 @@ static bool rot4_on() {
     return on == 1;
 }
 
+static bool rotw_on() {
+    static int w = -1;
+    if (w < 0) { const char* v = getenv("EXL3_ROTW"); w = !(v && v[0] == '0'); }
+    return w == 1;
+}
+
 void exl3m_rot_in(const void* x, int x_stride, const int* pick, const void* suh0, const void* suh1, void* out0,
                   void* out1, int rows, int K, int slots, int E, int x_bf16, cudaStream_t s) {
     const int P = rows * slots;
     if (rot4_on() && P > 64 && al8(x) && x_stride % 4 == 0 && al8(suh0) && al8(suh1) && al8(out0) && al8(out1) && K % 128 == 0) {
+        if (rotw_on()) {
+            const unsigned g = (unsigned)((P + 7) / 8);
+            if (x_bf16)
+                pdl_launch(exl3::rot_in4w_kernel<__nv_bfloat16>, g, 256, 0, s, (const __nv_bfloat16*)x, x_stride, pick,
+                           (const half*)suh0, (const half*)suh1, (half*)out0, (half*)out1, K, slots, P);
+            else
+                pdl_launch(exl3::rot_in4w_kernel<half>, g, 256, 0, s, (const half*)x, x_stride, pick, (const half*)suh0,
+                           (const half*)suh1, (half*)out0, (half*)out1, K, slots, P);
+            return;
+        }
         dim3 grid4((unsigned)((P + exl3::ROT_WARPS - 1) / exl3::ROT_WARPS), (unsigned)(K / 128), 2);
         if (x_bf16)
             pdl_launch(exl3::rot_in4_kernel<__nv_bfloat16>, grid4, exl3::ROT_WARPS * 32, 0, s, (const __nv_bfloat16*)x, x_stride,
@@ -2380,6 +2486,16 @@ void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void
 void exl3m_dense_rot(const void* x, int x_stride, const void* suh, void* out, int rows, int K, int G, int x_bf16,
                      cudaStream_t s) {
     if (rot4_on() && rows > 16 && al8(x) && x_stride % 4 == 0 && al8(suh) && al8(out) && K % 128 == 0) {
+        if (rotw_on()) {
+            const dim3 g((unsigned)((rows + 7) / 8), (unsigned)((K + 511) / 512));
+            if (x_bf16)
+                pdl_launch(exl3::dense_rot4w_kernel<__nv_bfloat16>, g, 256, 0, s, (const __nv_bfloat16*)x, x_stride,
+                           (const half*)suh, (half*)out, K, G, rows);
+            else
+                pdl_launch(exl3::dense_rot4w_kernel<half>, g, 256, 0, s, (const half*)x, x_stride, (const half*)suh,
+                           (half*)out, K, G, rows);
+            return;
+        }
         dim3 grid4((unsigned)((rows + exl3::ROT_WARPS - 1) / exl3::ROT_WARPS), (unsigned)(K / 128));
         if (x_bf16)
             pdl_launch(exl3::dense_rot4_kernel<__nv_bfloat16>, grid4, exl3::ROT_WARPS * 32, 0, s, (const __nv_bfloat16*)x,
@@ -2415,6 +2531,11 @@ void exl3m_dense_out(const float* Z, const void* svh, void* out, int rows, int N
                      int out_stride, cudaStream_t s) {
     if (rot4_on() && rows > 16 && al16(Z) && al8(svh) && (out_bf16 ? al8(out) : al16(out)) && out_stride % 4 == 0 &&
         N % 128 == 0) {
+        if (rotw_on()) {
+            pdl_launch(exl3::dense_out4w_kernel, dim3((unsigned)((rows + 7) / 8), (unsigned)((N + 511) / 512)), 256, 0, s, Z, (const half*)svh, out, rows, N,
+                       SK, G, out_bf16, out_stride);
+            return;
+        }
         dim3 grid4((unsigned)((rows + exl3::ROT_WARPS - 1) / exl3::ROT_WARPS), (unsigned)(N / 128));
         pdl_launch(exl3::dense_out4_kernel, grid4, exl3::ROT_WARPS * 32, 0, s, Z, (const half*)svh, out, rows, N, SK, G,
                    out_bf16, out_stride);

@@ -1393,11 +1393,16 @@ impl Engine {
                 self.lin(gate_up, np(&a.xn), h, t, np(&a.gu), true)?;
                 let (n, uo, ld) = gate_up.gu_layout(t, GEMV_ROWS);
                 self.swiglu(&self.st, np(&a.gu), at(&a.gu, uo), ld, np(&a.dact), n, t)?;
-                self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?;
-                self.lin(down, np(&a.dfull), n * w, t, np(&a.shout), false)?;
+                // one rank (prefill-pg): no gathers, so the down reads dact and the bf16 lands in a
+                let one = w == 1 && moe_out_fuse();
+                let dsrc = if one { np(&a.dact) } else { self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?; np(&a.dfull) };
+                self.lin(down, dsrc, n * w, t, np(&a.shout), false)?;
                 let dn = down.n_total();
-                ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), np(&a.mout), (t * dn) as i64) }, "dense out")?;
-                self.gather_cols(np(&a.mout), t, dn, 2, np(&a.a), prefill)?;
+                let mo = if one { np(&a.a) } else { np(&a.mout) };
+                ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), mo, (t * dn) as i64) }, "dense out")?;
+                if !one {
+                    self.gather_cols(np(&a.mout), t, dn, 2, np(&a.a), prefill)?;
+                }
                 self.ablit_rows(l, np(&a.a), t)
             }
             Mlp::Moe { .. } | Mlp::Routed { .. } => {

@@ -34,6 +34,8 @@ def main():
     parser.add_argument('--clients', type=int, default=0,
                         help='concurrent requests (default: the server\'s lane count)')
     parser.add_argument('--rounds', type=int, default=2, help='concurrent rounds after one serial pass')
+    parser.add_argument('--model', default='',
+                        help='served model name (default: the first id /v1/models lists)')
     parser.add_argument('--prompts', default='',
                         help='comma-separated PROMPTS indices, one per client (default: the first N); '
                              'e.g. 2,8 = two Python requests, 2,3 = Python + a story')
@@ -51,9 +53,13 @@ def main():
         if not 1 <= clients <= len(PROMPTS):
             raise SystemExit(f'--clients must be 1..{len(PROMPTS)}')
         indices = list(range(clients))
+    model = args.model
+    if not model:
+        with urlopen(args.url + '/v1/models', timeout=30) as response:
+            model = json.load(response)['data'][0]['id']
 
     def request(index):
-        body = {'model': 'deepseek-v4.1-flash', 'messages': [{'role': 'user', 'content': PROMPTS[index]}],
+        body = {'model': model, 'messages': [{'role': 'user', 'content': PROMPTS[index]}],
                 'temperature': 0, 'max_tokens': args.tokens, 'stream': False,
                 'reasoning_effort': 'none', 'ignore_eos': True}
         started = time.perf_counter()
@@ -61,8 +67,13 @@ def main():
                       {'Content-Type': 'application/json'})
         with urlopen(req, timeout=900) as response:
             result = json.load(response)
-        assert result['choices'][0]['message']['content']
-        stats = result.get('x_engine_stats', {})
+        # A model whose thinking cannot be turned off (GLM-5.3: its template always reasons and
+        # reasoning_effort 'none' does not stop it) can spend every max_tokens token in
+        # reasoning_content and leave content null: a full answer, not an empty one.
+        message = result['choices'][0]['message']
+        assert message.get('content') or message.get('reasoning_content'), message
+        # the Rust server reports its per-request stats under usage.muse
+        stats = result.get('x_engine_stats') or (result.get('usage') or {}).get('muse') or {}
         return {'prompt': index, 'wall_s': round(time.perf_counter() - started, 3),
                 'tokens': result['usage']['completion_tokens'],
                 'prefill_s': stats.get('prefill_s'), 'decode_tok_s': stats.get('decode_tok_s'),

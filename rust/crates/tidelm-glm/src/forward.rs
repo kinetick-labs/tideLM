@@ -1578,8 +1578,13 @@ impl Engine {
         let (sk_up, sk_dn) = self.routed_splits(arena, decode, n);
         // an exlr8 pack's sides are the layer's signs times one scale a 128-block: one rotation a row
         let shared = self.rot1 && is_exlr8(arena.cb);
+        // prefill-pg: the opt-in e4m3 gate/up (TIDELM_FP8_GU=1; changes numerics)
+        let fp8 = !shared && up_tiled && self.fat && !soft && h <= 4096 && fp8_gu();
         unsafe {
-            if shared {
+            if fp8 {
+                exl3m_rot_in8(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
+                              k as i32, 1, st);
+            } else if shared {
                 exl3m_rot_in_shared(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32,
                                     h as i32, k as i32, slots, 1, st);
             } else {
@@ -1590,6 +1595,12 @@ impl Engine {
                 exl3m_prefill_fat(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u), uids,
                                   np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, k as i32, nexp, 2,
                                   arena.cb, arena.max_k2.max(6), st);
+            } else if fp8 {
+                let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
+                exl3m_prefill_fat_gateup8(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
+                                          uids, np(&a.ucount), np(&a.members), h as i32, il as i32, p as i32, k as i32, nexp,
+                                          arena.cb, arena.max_k2.max(6), arena.pool(6), arena.pool(7), suh2,
+                                          cfg.moe_inter as i32, cfg.swiglu_limit, np(&a.pair), st);
             } else if up_tiled && self.fat {
                 // the fat tile with the epilogue fused: xd straight into the pair buffer
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
@@ -3249,4 +3260,10 @@ impl Engine {
             }
         }
     }
+}
+
+/// prefill-pg's opt-in e4m3 routed gate/up (TIDELM_FP8_GU=1), read once
+fn fp8_gu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TIDELM_FP8_GU").as_deref() == Ok("1"))
 }

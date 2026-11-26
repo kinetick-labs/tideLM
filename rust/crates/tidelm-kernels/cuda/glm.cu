@@ -1206,7 +1206,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
         }
 }
 
-// mla-fp8k (TIDELM_MLA_FP8K=1, GLM-5.3-Flash: RP 0): mla_kernel over all 64 heads of a row in one block,
+// mla-fp8k (on unless TIDELM_MLA_FP8K=0, GLM-5.3-Flash: RP 0): mla_kernel over all 64 heads of a row in one block,
 // the 32-key tile staged as its raw FP8 bytes (and the keys' 128-block scales) instead of widened BF16,
 // so the 64 query heads fit beside it: each key is fetched once a row instead of once a 32-head block,
 // and the fixed per-tile work (barriers, staging, partial stores) runs half as often. The BF16 key
@@ -2276,7 +2276,7 @@ int glm_kvb_dequant(void* stream, const void* w, const void* ws, void* out, int6
 
 static bool mla_fp8k() {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("TIDELM_MLA_FP8K"); on = e && e[0] == '1'; }
+    if (on < 0) { const char* e = getenv("TIDELM_MLA_FP8K"); on = !(e && e[0] == '0'); }
     return on == 1;
 }
 
@@ -2289,7 +2289,7 @@ static int mla_launch(void* stream, int mt, const void* q, int64_t q_ldg, int64_
     if (mt != 1 && mt != 2) return (int)cudaErrorInvalidValue;
     if (koff && split_n) return (int)cudaErrorInvalidValue;
     if (chunk % kMNT) return (int)cudaErrorInvalidValue;
-    // mla-fp8k (TIDELM_MLA_FP8K=1; GLM-5.3-Flash's RP 0, the 32-head path, 64 heads, 64+ rows): mla_f8_kernel
+    // mla-fp8k (on unless TIDELM_MLA_FP8K=0; bit-exact vs mla_kernel<2, 0>; GLM-5.3-Flash's RP 0, the 32-head path, 64 heads, 64+ rows): mla_f8_kernel
     if constexpr (RP == 0) {
         if (mt == 2 && H == 64 && T >= 64 && mla_fp8k()) {
             static bool set8 = false;

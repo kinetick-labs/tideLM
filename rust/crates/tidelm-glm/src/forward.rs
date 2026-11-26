@@ -1668,6 +1668,7 @@ impl Engine {
             self.fork()?;
         }
         let part = if decode { &a.split_part2 } else { &a.split_part };
+        let mut fused_out = false;
         if let Some((_, sh_down)) = shared_x {
             self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), 0, false)?;
         }
@@ -1689,7 +1690,13 @@ impl Engine {
                               np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, sk_dn, maxm, k as i32,
                               nexp, 1, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
-            if shared {
+            if !shared && !decode && !side && self.world == 1 && moe_out_fuse() {
+                // the combine stores the layer's bf16 output (moe_out's arithmetic) where the gather would copy it
+                let sh = if shared_x.is_some() { np(&a.shout) as *const c_void } else { std::ptr::null() };
+                exl3m_down_combine_bf(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), sh, out, n as i32, p as i32, dn as i32,
+                                      if up_tiled { 1 } else { sk_dn }, k as i32, slots, st);
+                fused_out = true;
+            } else if shared {
                 exl3m_down_combine_shared(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32,
                                           dn as i32, if up_tiled { 1 } else { sk_dn }, k as i32, slots, st);
             } else {
@@ -1713,6 +1720,9 @@ impl Engine {
                 Some(crate::weights::Attn::Ink(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
                 None => {}
             }
+        }
+        if fused_out {
+            return Ok(());
         }
         if shared_x.is_some() {
             ck(unsafe { glm_moe_out(st, np(&a.local), np(&a.shout), np(&a.mout), (n * dn) as i64) }, "moe out")?;
@@ -3266,4 +3276,10 @@ impl Engine {
 fn fp8_gu() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("TIDELM_FP8_GU").as_deref() == Ok("1"))
+}
+
+/// prefill-pg: the routed combine writes the MoE layer's bf16 output (TIDELM_HC_FUSE=0 off)
+fn moe_out_fuse() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TIDELM_HC_FUSE").map(|v| v != "0").unwrap_or(true))
 }

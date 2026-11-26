@@ -1955,6 +1955,56 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
     for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
 }
 
+// down_combine_kernel then glm.cu's moe_out_kernel on its row (prefill-pg): bf16(acc + shared) (or
+// bf16(0 + acc) with no shared expert) stored straight from the combine, as moe_out computes it.
+__global__ void down_combine_bf_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
+                                    const half* __restrict__ svh_d,
+                                    const float* __restrict__ wts, const float* __restrict__ sh, __nv_bfloat16* __restrict__ out, int P, int D, int SK,
+                                    int E, int slots) {
+    pdl_enter();
+    __shared__ float4 part[32][32];
+    const int r = blockIdx.x, blk = blockIdx.y;
+    const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = blk * 128 + 4 * lane;
+    const int p = r * slots + k;
+    const int e = pick[p];
+    float o[4];
+    if (e >= 0) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float s = 0.f;
+            for (int q = 0; q < SK; ++q) s += Z[((size_t)q * P + p) * D + n + j];
+            v[j] = s;
+        }
+        fwht128(v, lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+    } else {
+        // A negative pick is in no group (group_small_kernel), so Z holds nothing of it: its term
+        // is exactly 0. DSV41_EXPERT_TOPP's pruned picks take this branch.
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = 0.f;
+    }
+    part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
+    __syncthreads();
+    if (k != 0) return;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int q = 0; q < slots; ++q) {
+        const float w = wts[r * slots + q];
+        const float4 u = part[q][lane];
+        acc[0] = fmaf(w, u.x, acc[0]);
+        acc[1] = fmaf(w, u.y, acc[1]);
+        acc[2] = fmaf(w, u.z, acc[2]);
+        acc[3] = fmaf(w, u.w, acc[3]);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const size_t o = (size_t)r * D + n + j;
+        out[o] = __float2bfloat16_rn(sh ? acc[j] + sh[o] : 0.f + acc[j]);
+    }
+}
+
 // down_combine_kernel for an exlr8 pack, one rotation a row instead of one a pick. exlr8's down has
 // svh = signs.out (the layer's) x one scale a 128-block (the expert's, either sign), so
 // sum_k w_k ((z_k @ H) * svh_k) = ((sum_k w_k c_k z_k) @ H) * sign(svh of the first pick), c_k the pick's
@@ -2380,6 +2430,15 @@ void exl3m_down_combine(const float* Z, const int* pick, const void* svh_d, cons
     dim3 grid((unsigned)rows, (unsigned)(D / 128));
     pdl_launch(exl3::down_combine_kernel, grid, (unsigned)(32 * slots), 0, s, Z, pick, (const half*)svh_d, wts, out, P, D,
                                                                       SK, E, slots);
+}
+
+// exl3m_down_combine then moe_out (bf16 at y; sh the shared expert's fp32 rows or null)
+void exl3m_down_combine_bf(const float* Z, const int* pick, const void* svh_d, const float* wts, const float* sh, void* y,
+                           int rows, int P, int D, int SK, int slots, int E, cudaStream_t s) {
+    EXL3_CHECK(slots <= 32, "at most 32 slots a row");
+    dim3 grid((unsigned)rows, (unsigned)(D / 128));
+    pdl_launch(exl3::down_combine_bf_kernel, grid, (unsigned)(32 * slots), 0, s, Z, pick, (const half*)svh_d, wts, sh,
+               (__nv_bfloat16*)y, P, D, SK, E, slots);
 }
 
 // exl3m_down_combine for an exlr8 pack (down_combine_shared_kernel): the same arguments and output

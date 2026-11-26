@@ -2212,6 +2212,9 @@ extern "C" int glm_gemm_f16f32_tuned(void* handle, int m, int n, int k, const vo
     auto key = std::make_tuple(m, n, k, ldx, ldw, ldy);
     auto it = g_lt_picks.find(key);
     if (it == g_lt_picks.end()) {
+        // only the full prefill chunks are tuned (m a multiple of 512, at most 64 shapes): a ragged last
+        // chunk would otherwise pay a tuning pass for every new row count
+        if (m % 512 || g_lt_picks.size() >= 64) return 1;
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) return 1;
         LtPick pick;

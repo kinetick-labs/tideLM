@@ -421,9 +421,16 @@ impl Engine {
         let lw = &self.w.layers[l];
         let (a, fa) = (&self.act, &self.fl().act);
         let (h, st) = (self.cfg.hidden, self.st.raw());
+        let w = if site == 0 { &lw.ln_in } else { &lw.ln_post };
+        if hc_fuse() {
+            let rc = unsafe { tidelm_kernels::glm::glm_hc_pre_rms(st, np(&a.h), np(&fa.site[site][0]), np(&fa.hy), np(w), np(&a.xn),
+                                                                  h as i64, t as i32, h as i32, self.cfg.rms_eps) };
+            if rc != 1 {
+                return ck(rc, "hc pre+norm");
+            }
+        }
         ck(unsafe { tidelm_kernels::ds41::ds_hc_pre_norm(st, np(&a.h), np(&fa.site[site][0]), std::ptr::null(), np(&fa.hy), t as i32,
                                                          h as i32, 4, self.cfg.rms_eps) }, "hc pre")?;
-        let w = if site == 0 { &lw.ln_in } else { &lw.ln_post };
         ck(unsafe { glm_rmsnorm(st, np(&fa.hy), h as i64, std::ptr::null(), 0, np(w), np(&a.xn), h as i64, t as i32, h as i32,
                                 self.cfg.rms_eps) }, "hc norm")
     }

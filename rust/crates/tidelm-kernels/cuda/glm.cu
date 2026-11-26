@@ -260,6 +260,44 @@ __global__ void __launch_bounds__(1024) rmsnorm_kernel(__nv_bfloat16* __restrict
     }
 }
 
+// ds41's hc_pre_norm_v8_kernel (no weight: the streams weighted by pre, one bf16 rounding) then
+// rmsnorm_kernel<false> on its row, in one launch (prefill-pg): 1024 threads a row, column c =
+// threadIdx.x + i * 1024 as rmsnorm_kernel walks it; each value's arithmetic and the sum's order are
+// the two kernels', so hy and y keep their bits. hc = 4, N <= 4096.
+__global__ void __launch_bounds__(1024) hc_pre_rms_kernel(const __nv_bfloat16* __restrict__ h, const float* __restrict__ pre,
+                                                          __nv_bfloat16* __restrict__ hy, const __nv_bfloat16* __restrict__ w,
+                                                          __nv_bfloat16* __restrict__ y, int64_t ldy, int N, float eps) {
+    pdl_enter();
+    constexpr int HC = 4, kPer = 12;
+    __shared__ float red[32];
+    const int m = blockIdx.x;
+    const __nv_bfloat16* hr = h + (int64_t)m * HC * N;
+    const float* pm = pre + (int64_t)m * HC;
+    float v[kPer];
+    float ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int c = threadIdx.x + i * 1024;
+        v[i] = 0.f;
+        if (c < N) {
+            float acc = __fmul_rn(pm[0], bf(hr[c]));
+            for (int q = 1; q < HC; ++q) acc = fmaf(pm[q], bf(hr[(int64_t)q * N + c]), acc);
+            const __nv_bfloat16 vb = to_bf(acc);
+            hy[(int64_t)m * N + c] = vb;
+            v[i] = bf(vb);
+        }
+        ss += v[i] * v[i];
+    }
+    ss = block_sum(ss, red);
+    const float r = 1.f / sqrtf(ss / N + eps);
+    __nv_bfloat16* yr = y + (int64_t)m * ldy;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int c = threadIdx.x + i * 1024;
+        if (c < N) yr[c] = to_bf(bf(w[c]) * rbf(v[i] * r));
+    }
+}
+
 // ------------------------------------------------------------------ RoPE
 // rope_kernel._rope_kernel: interleaved pairs (x[2i], x[2i+1]) with frequency i in, de-interleaved
 // halves out (y[i], y[i + 32]); each BF16 product rounded to BF16 before the sum. cos / sin are
@@ -1704,6 +1742,15 @@ int glm_unshard(void* stream, const void* src, int64_t rank_stride, void* dst, i
     if (esz == 2) pdl_launch(unshard_kernel<uint16_t>, g, 256, 0, GST, static_cast<const uint16_t*>(src), rank_stride, static_cast<uint16_t*>(dst), M, n, world);
     else if (esz == 4) pdl_launch(unshard_kernel<uint32_t>, g, 256, 0, GST, static_cast<const uint32_t*>(src), rank_stride, static_cast<uint32_t*>(dst), M, n, world);
     else return (int)cudaErrorInvalidValue;
+    GRET;
+}
+
+// hc_pre_norm (hc 4, no weight) into hy, then glm_rmsnorm(hy -> y) in one launch; 1 = not this shape.
+int glm_hc_pre_rms(void* stream, const void* h, const void* pre, void* hy, const void* w, void* y, int64_t ldy, int T, int N,
+                   float eps) {
+    if (N < 4096 || N > 12 * 1024) return 1;   // glm_rmsnorm takes 1024 threads from 4096 columns
+    pdl_launch(hc_pre_rms_kernel, T, 1024, 0, GST, static_cast<const __nv_bfloat16*>(h), static_cast<const float*>(pre),
+               static_cast<__nv_bfloat16*>(hy), static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y), ldy, N, eps);
     GRET;
 }
 

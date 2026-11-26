@@ -13,6 +13,8 @@ extern "C" {
                        world: c_int, esz: c_int) -> c_int;
     pub fn glm_rmsnorm(stream: CudaStream, h: *mut c_void, ldh: i64, a: *const c_void, lda: i64, w: *const c_void,
                        y: *mut c_void, ldy: i64, t: c_int, n: c_int, eps: f32) -> c_int;
+    pub fn glm_hc_pre_rms(stream: CudaStream, h: *const c_void, pre: *const c_void, hy: *mut c_void, w: *const c_void,
+                          y: *mut c_void, ldy: i64, t: c_int, n: c_int, eps: f32) -> c_int;
     pub fn glm_rope(stream: CudaStream, x: *const c_void, xt: i64, xh: i64, y: *mut c_void, yt: i64, yh: i64, t: c_int,
                     h: c_int, cos: *const c_void, sin: *const c_void, pos: *const c_void) -> c_int;
     pub fn glm_kv_fp8(stream: CudaStream, x: *const c_void, ldx: i64, rows: *const c_void, q: *mut c_void, s: *mut c_void,

@@ -614,8 +614,7 @@ impl Engine {
                                  state, slot_f, lanes, nl, meta, np(&fa.y), dl as i64, sk, sg, sv, sb, (lk * dl) as i64,
                                  SAVE_ROWS as i32, khl as i32, t as i32), "kda chain")?;
         }
-        self.lin(&k.o, np(&fa.y), dl, t, np(&a.f32buf), false)?;
-        self.allreduce(np(&a.f32buf), t * h, np(&a.a), prefill)
+        self.out_proj(&k.o, np(&fa.y), dl, t, h, prefill)
     }
 
     /// A sparse-attention layer (MLA without RoPE over the indexer's selection) over `t` rows of xn
@@ -726,7 +725,18 @@ impl Engine {
                                       R_16BF, (hl * 256) as i64, 256, hl)?;
         }
         let _ = bound;
-        self.lin(&d.o, np(&a.o), hl * 256, t, np(&a.f32buf), false)?;
+        self.out_proj(&d.o, np(&a.o), hl * 256, t, h, prefill)
+    }
+
+    /// An attention output projection into act.a: one rank's EXL3 prefill rows straight to bf16
+    /// (dense_out4's bf16 store is to_bf of the fp32 value the f32 -> bf16 pass would round: the
+    /// same bits, one pass less; prefill-pg, TIDELM_HC_FUSE=0 off), else fp32 + allreduce.
+    fn out_proj(&self, m: &crate::lin::Lin, x: *const c_void, ldx: usize, t: usize, h: usize, prefill: bool) -> Result<()> {
+        let a = &self.act;
+        if self.world == 1 && t > GEMV_ROWS && matches!(m, crate::lin::Lin::Exl3(_)) && hc_fuse() {
+            return self.lin(m, x, ldx, t, np(&a.a), true);
+        }
+        self.lin(m, x, ldx, t, np(&a.f32buf), false)?;
         self.allreduce(np(&a.f32buf), t * h, np(&a.a), prefill)
     }
 }

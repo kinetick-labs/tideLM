@@ -1531,6 +1531,60 @@ __global__ void exl3_unpack_kernel(const uint32_t* __restrict__ tr, int NT, int 
     }
 }
 
+// exl3_unpack_kernel with the block's 8 trellis tiles staged in shared memory and a thread 8 columns
+// of one row (one 16-byte store) (prefill-pg): every value computed as there.
+__device__ __forceinline__ __half exl3_unpack_value(uint32_t state, int cb) {
+    if (cb >= 3) {
+        __half v;
+        if (cb <= 4) {
+            const uint32_t x = ((state * 0xCBAC1FEDu) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+            v = __hadd(__ushort_as_half((unsigned short)(x & 0xffffu)), __ushort_as_half((unsigned short)(x >> 16)));
+        } else {
+            const uint32_t x = state * 0x83DCD12Du;
+            const uint32_t h = 1024u + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
+            v = __float2half_rn((float)h * 0.00676727294921875f + -10.3828125f);
+        }
+        if (cb == 4 || cb == 6) return __ushort_as_half((unsigned short)((__half_as_ushort(v) + 0x40u) & 0xFF80u));
+        const __half cm = __hmax(__ushort_as_half((unsigned short)((__half_as_ushort(v) & 0x7C00u) + 0x1E00u)), __ushort_as_half(0x4200));
+        return __hsub(__hadd(v, cm), cm);
+    }
+    const uint32_t x = state * 0x83DCD12Du;
+    const uint32_t h = 1024u + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
+    const float v = (float)h * 0.00676727294921875f + -10.3828125f;
+    return __float2half_rn(v);
+}
+
+__global__ void __launch_bounds__(256) exl3_unpack8_kernel(const uint32_t* __restrict__ tr, int NT, int N, int bits, int cb,
+                                                           __half* __restrict__ W) {
+    pdl_enter();
+    __shared__ uint32_t sw[8 * 8 * 16];   // 8 tiles of 8 * bits words, bits <= 16
+    const int kt = blockIdx.x, c0 = blockIdx.y * 128;
+    const int nw = 8 * bits;
+    const uint32_t* src = tr + ((int64_t)kt * NT + c0 / 16) * nw;   // the block's 8 tiles are consecutive
+    for (int i = threadIdx.x; i < 8 * nw; i += blockDim.x) sw[i] = src[i];
+    __syncthreads();
+    const int r = threadIdx.x >> 4, cg = threadIdx.x & 15;
+    const int tl = cg >> 1, cb0 = (cg & 1) * 8;
+    const uint32_t* base = sw + tl * nw;
+    uint4 o;
+    __half* oe = reinterpret_cast<__half*>(&o);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int col = cb0 + e;
+        const int j = (r & 1) | (((r >> 3) & 1) << 1) | ((col >> 3) << 2);
+        const int lane = ((col & 7) << 2) | ((r >> 1) & 3);
+        const int p = lane * 8 + j;
+        const int first = (p + 1) * bits - 16 + 32 * nw;
+        const int i0 = (first / 32) % nw, i1 = (i0 + 1) % nw;
+        const uint32_t off = (uint32_t)(first % 32);
+        const uint32_t w0 = base[i0], w1 = base[i1];
+        const uint32_t hi = off >= 16 ? w0 << (off - 16) : w0 >> (16 - off);
+        const uint32_t lo = off > 16 ? w1 >> (48 - off) : 0u;
+        oe[e] = exl3_unpack_value((hi | lo) & 0xffffu, cb);
+    }
+    *reinterpret_cast<uint4*>(W + ((int64_t)kt * 16 + r) * N + c0 + cg * 8) = o;
+}
+
 // fp4_moe.build_routing's member codes for the EXL3 kernels: a block's pair p -> (p / K) * 32 +
 // p % K (row, pick), -1 kept; and the used blocks' count (block_slot >= 0 is a prefix).
 __global__ void member_codes_kernel(const int* __restrict__ pair, int n, int K, int* __restrict__ out) {
@@ -2035,6 +2089,11 @@ int glm_argmax_combine(void* stream, const void* pairs, int world, int M, void* 
 // cb: 2 mul1, 3 / 4 exlr8's mcg rounded to E4M3, 5 / 6 exlr8's mul1 rounded to E4M3 (tidelm_kernels::exl3::CB_*)
 int glm_exl3_unpack_cb(void* stream, const void* trellis, int K, int N, int bits, int cb, void* w) {
     if (K % 16 || N % 128 || cb < 2 || cb > 6) return (int)cudaErrorInvalidValue;
+    if (bits <= 16 && ((uintptr_t)w & 15) == 0) {
+        pdl_launch(exl3_unpack8_kernel, dim3(K / 16, N / 128), 256, 0, GST, static_cast<const uint32_t*>(trellis), N / 16, N, bits,
+                   cb, static_cast<__half*>(w));
+        GRET;
+    }
     pdl_launch(exl3_unpack_kernel, dim3(K / 16, N / 128), 256, 0, GST, static_cast<const uint32_t*>(trellis), N / 16, N, bits,
                                                                cb, static_cast<__half*>(w));
     GRET;

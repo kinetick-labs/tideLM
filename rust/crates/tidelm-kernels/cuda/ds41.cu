@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <cstdlib>
 #include <algorithm>
 #include <utility>
 
@@ -313,13 +314,21 @@ int launch_skinny(cudaStream_t st, const void* x, int64_t ldx, int64_t gstride, 
     // (wq_b at 12 rows 143 -> 189, wo_b 201 -> 227). M takes the exact tile up to 6 rows and
     // 8 / 12 / 16 above (the old tiers computed 6-row steps as 8).
     const bool wide = KIND == 0 && M > 8;
-    const int rows = wide ? 2 : 1;
+    // prefill-pg: past 16 rows (a prefill chunk's router), four weight rows a warp - each staged x value
+    // feeds four products instead of one (the 16-row tile was bound on its shared-memory reads); the
+    // per-output arithmetic is the same at any rows a warp (TIDELM_SKINNY_TALL=0 off)
+    static int tall_on = -1;
+    if (tall_on < 0) { const char* v = getenv("TIDELM_SKINNY_TALL"); tall_on = !(v && v[0] == '0'); }
+    const bool tall = KIND != 0 && M > 16 && tall_on;
+    const int rows = wide ? 2 : tall ? 4 : 1;
     const int mt = M <= 6 ? M : M <= 8 ? 8 : M <= 12 ? 12 : 16;
     // past 16 rows, 16-row tiles over gridDim.z (the slices a caller used to launch one by one)
     dim3 grid((N + kWarps * rows - 1) / (kWarps * rows), splits, (M + mt - 1) / mt);
 #define DS_SKINNY(R, MT, U) \
     pdl_launch(skinny_kernel<KIND, R, MT, U>, grid, kThreads, 0, st, xb, ldx, gstride, rpg, wb, sb, lds, M, N, K, ksplit, yb, yff, ldy, pp)
-    if (wide) {
+    if (tall) {
+        DS_SKINNY(4, 16, 2);
+    } else if (wide) {
         if (mt == 12) DS_SKINNY(2, 12, 2);
         else DS_SKINNY(2, 16, 2);
     } else {

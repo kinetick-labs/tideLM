@@ -1638,6 +1638,8 @@ impl Engine {
                 self.l2_lin(sh_down, n, PF_SH_DOWN)?;
             }
         }
+        let mut xdf_p = np(&a.xdf);
+        let mut hf_p = np(&a.hf);
         // one gather: both ranks' [routed xd | shared act]
         let per = p * il * 2 + if shared_x.is_some() { n * il * 2 } else { 0 };
         if w > 1 {
@@ -1647,6 +1649,11 @@ impl Engine {
                 ck(unsafe { glm_unshard(st, at(&a.gs, p * il * 2), (per / 2) as i64, np(&a.hf), n as i32, il as i32, w as i32, 2) },
                    "unshard shared")?;
             }
+        } else if !decode && moe_out_fuse() {
+            // prefill at one rank (prefill-pg): the routed and shared downs read the pair buffer where it
+            // is - the copies are 134 MB a 4096-row chunk (1.2 ms of idle tensor cores a layer)
+            xdf_p = np(&a.pair);
+            hf_p = hsh;
         } else {
             // One box: the pair's collectives are copies (these two, the output's below, o_proj's f32 ->
             // bf16 in the attention). Reading each source where it is instead - 3 launches a MoE layer and
@@ -1670,23 +1677,23 @@ impl Engine {
         let part = if decode { &a.split_part2 } else { &a.split_part };
         let mut fused_out = false;
         if let Some((_, sh_down)) = shared_x {
-            self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), 0, false)?;
+            self.lin_on(sst, x3, part, sh_down, hf_p, kd, n, np(&a.shout), 0, false)?;
         }
         unsafe {
             if up_tiled && self.fat {
-                exl3m_prefill_fat(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_fat(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                   uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, k as i32,
                                   nexp, 1, arena.cb, arena.max_k2.max(6), st);
             } else if up_tiled && mixed {
-                exl3m_prefill_smem_cb(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_smem_cb(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                       uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
                                       k as i32, nexp, 1, arena.cb, arena.max_k2, st);
             } else if up_tiled {
-                exl3m_prefill_smem_mode(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                exl3m_prefill_smem_mode(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                         uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
                                         k as i32, nexp, 1, 4, 1, 8, -4, st);
             } else {
-                exl3m_grouped(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
+                exl3m_grouped(xdf_p, xdf_p, np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
                               np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, sk_dn, maxm, k as i32,
                               nexp, 1, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }

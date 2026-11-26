@@ -4,6 +4,14 @@
 use crate::CudaStream;
 use std::os::raw::{c_int, c_void};
 
+#[link(name = "cublasLt")]
+extern "C" {
+    /// prefill-pg: y[m][n] f32 = x[m][k] f16 . W[k][n] f16 through a per-shape pick (cublasLt where it is faster
+    /// and bit-identical); 1: the caller runs cublasGemmEx itself
+    pub fn glm_gemm_f16f32_tuned(handle: *mut c_void, m: c_int, n: c_int, k: c_int, x: *const c_void, ldx: c_int,
+                                 w: *const c_void, ldw: c_int, y: *mut c_void, ldy: c_int) -> c_int;
+}
+
 extern "C" {
     pub fn glm_embed(stream: CudaStream, ids: *const c_void, t: c_int, q: *const c_void, sc: *const c_void, lo: c_int,
                      vl: c_int, h: c_int, pos: *const c_void, out: *mut c_void) -> c_int;

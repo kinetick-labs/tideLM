@@ -13,6 +13,13 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <utility>
+#include <cublas_v2.h>
+#include <cublasLt.h>
+#include <map>
+#include <mutex>
+#include <tuple>
+#include <cstdlib>
+#include <cstdio>
 
 // Programmatic dependent launch, as ds41.cu's: every kernel here (but the L2 prefetch, launched on
 // its own branch) starts with pdl_enter(), and once the GLM engine switches it on (glm_set_pdl;
@@ -2164,3 +2171,136 @@ int glm_rank1(void* stream, void* x, int64_t ldx, const void* r, float alpha, in
 }
 
 }  // extern "C"
+
+// ------------------------------------------------------------------ tuned prefill GEMM (prefill-pg)
+// y[m][n] f32 = x[m][k] f16 . W[k][n] f16 (row-major, the EXL3 dense prefill's GEMM). cuBLAS's default
+// pick is slow at some prefill shapes (K = 2048: 1.32 ms where a cublasLt tile takes 1.00). The first
+// call of a shape times cublasGemmEx against cublasLt's no-workspace, no-split-K algorithms on the real
+// operands and keeps one only if it is faster AND every output bit matches cublasGemmEx's; later calls
+// reuse the pick. Returns 1 when the caller should run cublasGemmEx itself (the default, stream capture,
+// any error).
+__global__ void neq_count_kernel(const uint32_t* __restrict__ a, const uint32_t* __restrict__ b, size_t n,
+                                 unsigned long long* __restrict__ c) {
+    unsigned long long d = 0;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        d += a[i] != b[i];
+    if (d) atomicAdd(c, d);
+}
+
+namespace {
+struct LtPick {
+    bool lt = false;
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+};
+std::mutex g_lt_mu;
+std::map<std::tuple<int, int, int, int, int, int>, LtPick> g_lt_picks;
+cublasLtHandle_t g_lt = nullptr;
+}  // namespace
+
+extern "C" int glm_gemm_f16f32_tuned(void* handle, int m, int n, int k, const void* x, int ldx, const void* w, int ldw,
+                                     void* y, int ldy) {
+    static int on = -1;
+    if (on < 0) { const char* v = getenv("TIDELM_GEMM_TUNE"); on = !(v && v[0] == '0'); }
+    if (!on) return 1;
+    cublasHandle_t h = static_cast<cublasHandle_t>(handle);
+    cudaStream_t st = nullptr;
+    if (cublasGetStream(h, &st) != CUBLAS_STATUS_SUCCESS) return 1;
+    std::lock_guard<std::mutex> lock(g_lt_mu);
+    const float one = 1.f, zero = 0.f;
+    auto key = std::make_tuple(m, n, k, ldx, ldw, ldy);
+    auto it = g_lt_picks.find(key);
+    if (it == g_lt_picks.end()) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) return 1;
+        LtPick pick;
+        auto ref = [&] {
+            return cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one, w, CUDA_R_16F, ldw, x, CUDA_R_16F, ldx, &zero, y,
+                                CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        };
+        bool ok = g_lt || cublasLtCreate(&g_lt) == CUBLAS_STATUS_SUCCESS;
+        ok = ok && cublasLtMatmulDescCreate(&pick.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS;
+        ok = ok && cublasLtMatrixLayoutCreate(&pick.A, CUDA_R_16F, n, k, ldw) == CUBLAS_STATUS_SUCCESS;
+        ok = ok && cublasLtMatrixLayoutCreate(&pick.B, CUDA_R_16F, k, m, ldx) == CUBLAS_STATUS_SUCCESS;
+        ok = ok && cublasLtMatrixLayoutCreate(&pick.C, CUDA_R_32F, n, m, ldy) == CUBLAS_STATUS_SUCCESS;
+        float* tmp = nullptr;
+        unsigned long long* cnt = nullptr;
+        const size_t ny = (size_t)m * ldy;
+        ok = ok && cudaMalloc(&tmp, ny * 4) == cudaSuccess && cudaMalloc(&cnt, 8) == cudaSuccess;
+        cudaEvent_t e0 = nullptr, e1 = nullptr;
+        ok = ok && cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
+        auto timeit = [&](auto&& fn) {
+            fn();
+            cudaEventRecord(e0, st);
+            for (int i = 0; i < 4; ++i) fn();
+            cudaEventRecord(e1, st);
+            cudaEventSynchronize(e1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            return ms;
+        };
+        if (ok) {
+            const float t_ref = timeit(ref);   // y holds the reference after this
+            cublasLtMatmulPreference_t pr = nullptr;
+            size_t wss = 0;
+            cublasLtMatmulHeuristicResult_t res[16];
+            int nres = 0;
+            if (cublasLtMatmulPreferenceCreate(&pr) == CUBLAS_STATUS_SUCCESS &&
+                cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wss, sizeof(wss)) ==
+                    CUBLAS_STATUS_SUCCESS &&
+                cublasLtMatmulAlgoGetHeuristic(g_lt, pick.op, pick.A, pick.B, pick.C, pick.C, pr, 16, res, &nres) ==
+                    CUBLAS_STATUS_SUCCESS) {
+                float best = t_ref * 0.97f;
+                for (int i = 0; i < nres; ++i) {
+                    if (res[i].state != CUBLAS_STATUS_SUCCESS || res[i].workspaceSize != 0) continue;
+                    int sk = 1;
+                    size_t sz = 0;
+                    cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &sk, sizeof(sk), &sz);
+                    if (sk > 1) continue;
+                    auto run = [&] {
+                        return cublasLtMatmul(g_lt, pick.op, &one, w, pick.A, x, pick.B, &zero, tmp, pick.C, tmp, pick.C,
+                                              &res[i].algo, nullptr, 0, st);
+                    };
+                    if (run() != CUBLAS_STATUS_SUCCESS) continue;
+                    cudaMemsetAsync(cnt, 0, 8, st);
+                    // every output bit against cublasGemmEx's (dense outputs only)
+                    unsigned long long d = 0;
+                    if (ldy == n) {
+                        neq_count_kernel<<<1024, 256, 0, st>>>(reinterpret_cast<const uint32_t*>(y),
+                                                               reinterpret_cast<const uint32_t*>(tmp), ny, cnt);
+                        cudaMemcpyAsync(&d, cnt, 8, cudaMemcpyDeviceToHost, st);
+                        cudaStreamSynchronize(st);
+                    } else {
+                        d = 1;   // strided outputs: not compared, not taken
+                    }
+                    if (d) continue;
+                    const float t = timeit(run);
+                    if (t < best) {
+                        best = t;
+                        pick.lt = true;
+                        pick.algo = res[i].algo;
+                    }
+                }
+            }
+            if (pr) cublasLtMatmulPreferenceDestroy(pr);
+            if (getenv("TIDELM_GEMM_TUNE_LOG"))
+                fprintf(stderr, "gemm tune m %d n %d k %d: default %.3f ms, %s\n", m, n, k, t_ref / 4,
+                        pick.lt ? "cublasLt pick" : "default kept");
+        }
+        if (e0) cudaEventDestroy(e0);
+        if (e1) cudaEventDestroy(e1);
+        if (tmp) cudaFree(tmp);
+        if (cnt) cudaFree(cnt);
+        it = g_lt_picks.emplace(key, pick).first;
+        if (!pick.lt) return ok ? 0 : 1;   // y already holds the reference result when ok
+        // else fall through: y holds the reference too, and the pick's bits are the same
+        return 0;
+    }
+    const LtPick& p = it->second;
+    if (!p.lt) return 1;
+    return cublasLtMatmul(g_lt, p.op, &one, w, p.A, x, p.B, &zero, y, p.C, y, p.C, &p.algo, nullptr, 0, st) ==
+                   CUBLAS_STATUS_SUCCESS
+               ? 0
+               : 1;
+}

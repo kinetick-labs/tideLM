@@ -1573,7 +1573,11 @@ impl Engine {
                                        np(&a.block_slot), np(&a.block_pair), np(&a.block_route), 64) }, "route blocks")?;
             ck(unsafe { glm_member_codes(st, np(&a.block_pair), nb * 64, k as i32, np(&a.members)) }, "member codes")?;
             ck(unsafe { glm_count_live(st, np(&a.block_slot), nb, np(&a.ucount)) }, "live blocks")?;
-            (64, nb)
+            // prefill-27k: the expert kernels' grid bounds the blocks this layer's picks can fill (its
+            // experts and the transient slot), not every slot's: at a 4096-row chunk 800 routing blocks,
+            // not 12,245 - the rest were programs that exit on ucount (TIDELM_TIGHT_GRID=0: as before)
+            let reach = if tight_grid() { arena.slots.min(cfg.experts + 1) } else { arena.slots };
+            (64, unsafe { ds_route_blocks(p as i32, reach as i32, 64) }.min(nb))
         };
         let uids = if decode { np(&a.uids) } else { np(&a.block_slot) };
         // prefill: the smem tile for the decoder's arena (the shipped mul1 2-3-bit kernel, or the
@@ -3282,6 +3286,12 @@ impl Engine {
             }
         }
     }
+}
+
+/// prefill-27k: the routed expert kernels' grid over the blocks one layer can fill (default on)
+fn tight_grid() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TIDELM_TIGHT_GRID").as_deref() != Ok("0"))
 }
 
 /// prefill-pg's opt-in e4m3 routed gate/up (TIDELM_FP8_GU=1), read once

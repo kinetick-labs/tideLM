@@ -1308,6 +1308,56 @@ __global__ void hc_post_kernel(const __nv_bfloat16* __restrict__ y, const __nv_b
     for (int j = 0; j < HC; ++j) out[((int64_t)m * HC + j) * D + d] = to_bf(o[j]);
 }
 
+// hc_post_kernel then row_rsqrt_v8_kernel on its output in one pass (prefill-pg): a 1024-thread block
+// a row walks the row's hc * D / 8 pieces as row_rsqrt_v8_kernel does (piece i, i + 1024, ...), each
+// piece's outputs computed as hc_post_kernel computes them and their squares summed in that order, so
+// both outputs keep their bits. In place: every read is done before the block's first write.
+constexpr int kHcPieces = 2;   // pieces a thread: hc * D / 8 <= 1024 * kHcPieces
+__global__ void __launch_bounds__(1024) hc_post_rsq_kernel(const __nv_bfloat16* __restrict__ y, const __nv_bfloat16* residual,
+                                                           const float* __restrict__ post, const float* __restrict__ comb,
+                                                           __nv_bfloat16* out, int D, float eps, float* __restrict__ rsq) {
+    pdl_enter();
+    constexpr int HC = 4;
+    __shared__ float scratch[32];
+    const int m = blockIdx.x;
+    const int np = HC * D / 8, per = D / 8;
+    const float* cm = comb + m * HC * HC;
+    uint4 ov[kHcPieces];
+    float ss = 0.f;
+#pragma unroll
+    for (int u = 0; u < kHcPieces; ++u) {
+        const int i = threadIdx.x + 1024 * u;
+        if (i >= np) break;
+        const int j = i / per, d = (i % per) * 8;
+        float yv[8], r[HC][8];
+        bf16x8_to_f32(*reinterpret_cast<const uint4*>(y + (int64_t)m * D + d), yv);
+#pragma unroll
+        for (int c = 0; c < HC; ++c)
+            bf16x8_to_f32(*reinterpret_cast<const uint4*>(residual + ((int64_t)m * HC + c) * D + d), r[c]);
+        __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&ov[u]);
+        const float pj = post[m * HC + j];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float mixed = cm[0 * HC + j] * r[0][e];
+#pragma unroll
+            for (int c = 1; c < HC; ++c) mixed = fmaf(cm[c * HC + j], r[c][e], mixed);
+            oe[e] = to_bf(pj * yv[e] + mixed);
+            const float f = bf(oe[e]);
+            ss = fmaf(f, f, ss);
+        }
+    }
+    __syncthreads();   // in place: every thread's reads before any write
+#pragma unroll
+    for (int u = 0; u < kHcPieces; ++u) {
+        const int i = threadIdx.x + 1024 * u;
+        if (i >= np) break;
+        const int j = i / per, d = (i % per) * 8;
+        *reinterpret_cast<uint4*>(out + ((int64_t)m * HC + j) * D + d) = ov[u];
+    }
+    const float t = block_sum(ss, scratch);
+    if (threadIdx.x == 0) rsq[m] = rsqrtf(t * (1.f / (float)(HC * D)) + eps);
+}
+
 // ------------------------------------------------------------------ rope
 // v41_ref.apply_rotary on the last `rd` dims of each head: adjacent pairs as complex numbers
 // times freqs_cis[pos] (cos, sin) in fp32, rounded back to bf16; `inverse` uses the conjugate.
@@ -3683,6 +3733,18 @@ int ds_hc_post(void* stream, const void* y, const void* residual, const void* po
     pdl_launch(hc_post_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(y), static_cast<const __nv_bfloat16*>(residual),
         static_cast<const float*>(post), static_cast<const float*>(comb), static_cast<__nv_bfloat16*>(out), D);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// ds_hc_post then ds_row_rsqrt(out, hc * D) in one launch; 1 = not this shape (call the two).
+int ds_hc_post_rsq(void* stream, const void* y, const void* residual, const void* post, const void* comb, void* out,
+                   int M, int D, float eps, void* rsq) {
+    if (D % 8 || 4 * D / 8 > 1024 * kHcPieces || ((uintptr_t)y & 15) || ((uintptr_t)residual & 15) || ((uintptr_t)out & 15))
+        return 1;
+    pdl_launch(hc_post_rsq_kernel, M, 1024, 0, static_cast<cudaStream_t>(stream),
+        static_cast<const __nv_bfloat16*>(y), static_cast<const __nv_bfloat16*>(residual),
+        static_cast<const float*>(post), static_cast<const float*>(comb), static_cast<__nv_bfloat16*>(out), D, eps,
+        static_cast<float*>(rsq));
     return static_cast<int>(cudaGetLastError());
 }
 

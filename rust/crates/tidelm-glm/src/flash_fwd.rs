@@ -397,15 +397,17 @@ impl Engine {
 
     // ------------------------------------------------------------------ mHC
     /// A site's mixes of the stream (act.h [t][4][H]): pre, post, comb into `site` (0 attention, 1 MLP).
-    fn hc_mixes(&self, l: usize, site: usize, t: usize) -> Result<()> {
+    fn hc_mixes(&self, l: usize, site: usize, t: usize, rsq_done: bool) -> Result<()> {
         let hc = self.cfg.hc.unwrap();
         let hw: &HcW = self.w.layers[l].hc.as_ref().ok_or("an mHC site on a layer without one")?;
         let (fnw, base, scale) = if site == 0 { (&hw.attn_fn, &hw.attn_base, &hw.attn_scale) } else { (&hw.ffn_fn, &hw.ffn_base, &hw.ffn_scale) };
         let (a, fa) = (&self.act, &self.fl().act);
         let k = hc.mult * self.cfg.hidden;
         let st = self.st.raw();
-        ck(unsafe { tidelm_kernels::ds41::ds_row_rsqrt(st, np(&a.h), k as i64, t as i32, k as i32, self.cfg.rms_eps, np(&fa.rsq)) },
-           "hc rsqrt")?;
+        if !rsq_done {
+            ck(unsafe { tidelm_kernels::ds41::ds_row_rsqrt(st, np(&a.h), k as i64, t as i32, k as i32, self.cfg.rms_eps, np(&fa.rsq)) },
+               "hc rsqrt")?;
+        }
         crate::lin::gemm(&self.st, &a.split_part, np(&a.h), k, fnw, t, np(&fa.mixes), true, 24)?;
         let s = &fa.site[site];
         ck(unsafe { tidelm_kernels::ds41::ds_hc_sinkhorn(st, np(&fa.mixes), np(&fa.rsq), np(scale), np(base), t as i32, hc.iters as i32,
@@ -414,8 +416,8 @@ impl Engine {
 
     /// A site's input: its mixes, the streams weighted by pre (bf16, one rounding), RMSNorm'd by
     /// the layer's norm into xn.
-    fn hc_pre(&self, l: usize, site: usize, t: usize) -> Result<()> {
-        self.hc_mixes(l, site, t)?;
+    fn hc_pre(&self, l: usize, site: usize, t: usize, rsq_done: bool) -> Result<()> {
+        self.hc_mixes(l, site, t, rsq_done)?;
         let lw = &self.w.layers[l];
         let (a, fa) = (&self.act, &self.fl().act);
         let (h, st) = (self.cfg.hidden, self.st.raw());
@@ -427,11 +429,22 @@ impl Engine {
     }
 
     /// A site's output: the stream <- post (outer) the sublayer's output (act.a) + comb^T the stream.
-    fn hc_post(&self, site: usize, t: usize) -> Result<()> {
+    /// `rsq`: also the next site's row rsqrt of the new stream into fa.rsq (one pass, same bits;
+    /// prefill-pg, TIDELM_HC_FUSE=0 off); true when it was done.
+    fn hc_post(&self, site: usize, t: usize, rsq: bool) -> Result<bool> {
         let (a, fa) = (&self.act, &self.fl().act);
         let s = &fa.site[site];
+        if rsq && hc_fuse() {
+            let rc = unsafe { tidelm_kernels::ds41::ds_hc_post_rsq(self.st.raw(), np(&a.a), np(&a.h), np(&s[1]), np(&s[2]), np(&a.h),
+                                                                    t as i32, self.cfg.hidden as i32, self.cfg.rms_eps, np(&fa.rsq)) };
+            if rc != 1 {
+                ck(rc, "hc post+rsqrt")?;
+                return Ok(true);
+            }
+        }
         ck(unsafe { tidelm_kernels::ds41::ds_hc_post(self.st.raw(), np(&a.a), np(&a.h), np(&s[1]), np(&s[2]), np(&a.h), t as i32,
-                                                     self.cfg.hidden as i32) }, "hc post")
+                                                     self.cfg.hidden as i32) }, "hc post")?;
+        Ok(false)
     }
 
     /// Decode rows (up to FMA_ROWS: the mix GEMV's FMA path, whose bits the fused kernels keep): layer
@@ -473,17 +486,18 @@ impl Engine {
             self.shared_up_prefetch(l, t, prefill)?;
             return self.hc_site(l, 1, t, true);
         }
+        let mut rsq = false;
         if l > 0 {
-            self.hc_post(1, t)?;
+            rsq = self.hc_post(1, t, true)?;
             self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(l - 1))?;
         } else {
             self.dump("tok", np(&self.act.tok), t * 4, None)?;
         }
-        self.hc_pre(l, 0, t)?;
+        self.hc_pre(l, 0, t, rsq)?;
         self.attention(l, t, prefill)?;
         self.shared_up_prefetch(l, t, prefill)?;
-        self.hc_post(0, t)?;
-        self.hc_pre(l, 1, t)
+        let rsq = self.hc_post(0, t, true)?;
+        self.hc_pre(l, 1, t, rsq)
     }
 
     /// Decode rows: the MoE's shared gate | up into L2 while the MLP's mHC site runs (flash_pf).
@@ -501,7 +515,7 @@ impl Engine {
     /// The decoder's end on an mHC model: the last MLP site closed, the streams' mean (Glm5Next's
     /// hyper head), the final norm into hn.
     pub(crate) fn flash_final(&self, t: usize) -> Result<()> {
-        self.hc_post(1, t)?;
+        self.hc_post(1, t, false)?;
         self.dump(&format!("x{}", self.cfg.layers - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(self.cfg.layers - 1))?;
         let (a, fa) = (&self.act, &self.fl().act);
         let h = self.cfg.hidden;
@@ -708,4 +722,9 @@ impl Engine {
         self.lin(&d.o, np(&a.o), hl * 256, t, np(&a.f32buf), false)?;
         self.allreduce(np(&a.f32buf), t * h, np(&a.a), prefill)
     }
+}
+
+fn hc_fuse() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TIDELM_HC_FUSE").map(|v| v != "0").unwrap_or(true))
 }

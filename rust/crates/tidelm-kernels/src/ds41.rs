@@ -77,6 +77,11 @@ extern "C" {
         comb: *const c_void, out: *mut c_void, m: c_int, d: c_int,
     ) -> c_int;
 
+    pub fn ds_hc_post_rsq(
+        stream: CudaStream, y: *const c_void, residual: *const c_void, post: *const c_void,
+        comb: *const c_void, out: *mut c_void, m: c_int, d: c_int, eps: f32, rsq: *mut c_void,
+    ) -> c_int;
+
     /// RoPE in place on dims [offset, offset + rd) of each of `heads` heads per row;
     /// `table` is float2 [positions][rd/2] (cos, sin).
     pub fn ds_rope(

@@ -915,13 +915,43 @@ __global__ void __launch_bounds__(256) mla_kernel(
     uint4 pre_raw[kPF][kPieces];
     float pre_s[kPF][kPieces];
     bool pre_ok[kPF][kPieces];
-    auto prefetch = [&](int n0, uint4 (&raw)[kPieces], float (&sc)[kPieces], bool (&okv)[kPieces]) {
+    // The picks are read a tile before their keys (prefill-pg): a tile's key loads no longer wait on
+    // its pick loads; same keys, same bits.
+    int pre_key[kPieces];
+    auto keyld = [&](int n0, int (&kk)[kPieces]) {
 #pragma unroll
         for (int u = 0; u < kPieces; ++u) {
-            const int i = tid + 256 * u, j = i / kNP, c = i % kNP;
-            const int n = n0 + j;
-            int key = -1;
-            if (n < k_hi) key = idx ? idx[(int64_t)t * ld_idx + n] : n;
+            const int n = n0 + (tid + 256 * u) / kNP;
+            kk[u] = n < k_hi ? (idx ? idx[(int64_t)t * ld_idx + n] : n) : -1;
+        }
+    };
+    auto prefetch = [&](int n0, uint4 (&raw)[kPieces], float (&sc)[kPieces], bool (&okv)[kPieces]) {
+        int kk[kPieces];
+        keyld(n0, kk);
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int i = tid + 256 * u, c = i % kNP;
+            const int key = kk[u];
+            const bool ok = key >= 0 && key <= bnd;
+            okv[u] = ok;
+            raw[u] = make_uint4(0, 0, 0, 0);
+            sc[u] = 0.f;
+            if (ok && !(c_mla_probe & 1)) {
+                const int64_t kr = key_row(key, split_n);
+                if (c < 32) {
+                    raw[u] = *reinterpret_cast<const uint4*>(cq + kr * kLat + c * 16);
+                    sc[u] = rbf(cs[kr * 4 + c / 8]);
+                } else {
+                    raw[u] = reinterpret_cast<const uint4*>(cr + kr * 64)[c - 32];
+                }
+            }
+        }
+    };
+    auto prefetch_k = [&](const int (&kk)[kPieces], uint4 (&raw)[kPieces], float (&sc)[kPieces], bool (&okv)[kPieces]) {
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int i = tid + 256 * u, c = i % kNP;
+            const int key = kk[u];
             const bool ok = key >= 0 && key <= bnd;
             okv[u] = ok;
             raw[u] = make_uint4(0, 0, 0, 0);
@@ -940,6 +970,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
 #pragma unroll
     for (int sl = 0; sl < kPF; ++sl)
         if (k_lo + sl * kMNT < k_hi) prefetch(k_lo + sl * kMNT, pre_raw[sl], pre_s[sl], pre_ok[sl]);
+    keyld(k_lo + kPF * kMNT, pre_key);
     for (int nb = k_lo; nb < k_hi; nb += kPF * kMNT) {
 #pragma unroll
     for (int sl = 0; sl < kPF; ++sl) {
@@ -960,24 +991,31 @@ __global__ void __launch_bounds__(256) mla_kernel(
             if (c == 0) valid[j] = pre_ok[sl][u];
         }
         __syncthreads();
-        if (n0 + kPF * kMNT < k_hi) prefetch(n0 + kPF * kMNT, pre_raw[sl], pre_s[sl], pre_ok[sl]);
+        if (n0 + kPF * kMNT < k_hi) {
+            prefetch_k(pre_key, pre_raw[sl], pre_s[sl], pre_ok[sl]);
+            keyld(n0 + 2 * kPF * kMNT, pre_key);
+        }
         // scores: (m tile, 8 keys) jobs over the warps
         for (int job = warp; job < MT * (kMNT / 8); job += 8) {
             const int mt = job / (kMNT / 8), kb = job % (kMNT / 8);
             float c4[4] = {0.f, 0.f, 0.f, 0.f};
             const __nv_bfloat16* kn = Ks + (kb * 8 + r) * kMLD;
             const __nv_bfloat16* qa = Qs + (mt * 16) * kMLD;
+            // the same fragments through ldmatrix (prefill-pg): A a 16x16 tile, B two k16 steps of 8 keys
+            static_assert(kMD % 32 == 0, "score loop: two k16 steps a round");
+            const __nv_bfloat16* qa_l = qa + (lane & 15) * kMLD + (lane >> 4) * 8;
+            const __nv_bfloat16* kb_l = Ks + (kb * 8 + (lane & 7)) * kMLD + (lane >> 3) * 8;
 #pragma unroll 4
-            for (int ks = 0; ks < ((c_mla_probe & 2) ? 0 : kMD / 16); ++ks) {
-                const int d0 = ks * 16;
-                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(qa + r * kMLD + d0 + 2 * qd);
-                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(qa + (r + 8) * kMLD + d0 + 2 * qd);
-                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(qa + r * kMLD + d0 + 8 + 2 * qd);
-                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(qa + (r + 8) * kMLD + d0 + 8 + 2 * qd);
-                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(kn + d0 + 2 * qd);
-                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(kn + d0 + 8 + 2 * qd);
-                mma_bf16(c4, a0, a1, a2, a3, b0, b1);
+            for (int ks = 0; ks < ((c_mla_probe & 2) ? 0 : kMD / 32); ++ks) {
+                const int d0 = ks * 32;
+                uint32_t bb[4], aa[4];
+                ldsm_x4(bb, kb_l + d0);
+                ldsm_x4(aa, qa_l + d0);
+                mma_bf16(c4, aa[0], aa[1], aa[2], aa[3], bb[0], bb[1]);
+                ldsm_x4(aa, qa_l + d0 + 16);
+                mma_bf16(c4, aa[0], aa[1], aa[2], aa[3], bb[2], bb[3]);
             }
+            (void)kn;
             const int k0 = kb * 8 + 2 * qd;
             float* pr = Ps + (mt * 16) * kMPS;
             pr[r * kMPS + k0] = valid[k0] ? c4[0] * scale : -INFINITY;
@@ -987,21 +1025,41 @@ __global__ void __launch_bounds__(256) mla_kernel(
         }
         __syncthreads();
         // online softmax: a warp takes 2 * MT heads, a lane one key
+        // the warp's 2 * MT heads side by side (prefill-pg): each head's arithmetic as before
+        {
+            constexpr int NU = 2 * MT;
+            float mo[NU], s0[NU], mn[NU], e0[NU], ls[NU];
 #pragma unroll
-        for (int u = 0; u < 2 * MT; ++u) {
-            const int hh = warp * 2 * MT + u;
-            const float mo = m_run[hh];
-            const float s0 = Ps[hh * kMPS + lane];
-            const float mn = fmaxf(fmaxf(mo, warp_max(s0)), -1e30f);
-            const float e0 = expf(s0 - mn);
-            const float ls = warp_sum(e0);
-            Ps[hh * kMPS + lane] = e0;
-            __syncwarp();
-            if (lane == 0) {
-                const float al = expf(mo - mn);
-                alpha[hh] = al;
-                l_run[hh] = l_run[hh] * al + ls;
-                m_run[hh] = mn;
+            for (int u = 0; u < NU; ++u) {
+                const int hh = warp * NU + u;
+                mo[u] = m_run[hh];
+                s0[u] = Ps[hh * kMPS + lane];
+                mn[u] = s0[u];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int u = 0; u < NU; ++u) mn[u] = fmaxf(mn[u], __shfl_xor_sync(0xffffffffu, mn[u], o));
+#pragma unroll
+            for (int u = 0; u < NU; ++u) {
+                mn[u] = fmaxf(fmaxf(mo[u], mn[u]), -1e30f);
+                e0[u] = expf(s0[u] - mn[u]);
+                ls[u] = e0[u];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int u = 0; u < NU; ++u) ls[u] += __shfl_xor_sync(0xffffffffu, ls[u], o);
+#pragma unroll
+            for (int u = 0; u < NU; ++u) {
+                const int hh = warp * NU + u;
+                Ps[hh * kMPS + lane] = e0[u];
+                if (lane == 0) {
+                    const float al = expf(mo[u] - mn[u]);
+                    alpha[hh] = al;
+                    l_run[hh] = l_run[hh] * al + ls[u];
+                    m_run[hh] = mn[u];
+                }
             }
         }
         __syncthreads();

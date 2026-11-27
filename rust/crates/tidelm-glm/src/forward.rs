@@ -1589,8 +1589,18 @@ impl Engine {
         let shared = self.rot1 && is_exlr8(arena.cb);
         // prefill-pg: the opt-in e4m3 gate/up (TIDELM_FP8_GU=1; changes numerics)
         let fp8 = !shared && up_tiled && self.fat && !soft && h <= 4096 && fp8_gu();
+        // rotkda lead 5: the input rotation inside the fat gate/up tile (TIDELM_FAT_ROT=1; same bits)
+        let fold = !shared && !fp8 && up_tiled && self.fat && !soft && fat_rot();
         unsafe {
-            if fp8 {
+            let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
+            let folded = fold
+                && exl3m_prefill_fat_gateup_rot(x, h as i32, arena.pool(3), arena.pool(4), np(&arena.t1p), np(&arena.t3p),
+                                                np(&arena.k2g), np(&arena.k2u), uids, np(&a.ucount), np(&a.members), h as i32,
+                                                il as i32, p as i32, k as i32, nexp, arena.cb, arena.max_k2.max(6),
+                                                arena.pool(6), arena.pool(7), suh2, cfg.moe_inter as i32, cfg.swiglu_limit,
+                                                np(&a.pair), st) != 0;
+            if folded {
+            } else if fp8 {
                 exl3m_rot_in8(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
                               k as i32, 1, st);
             } else if shared {
@@ -1610,6 +1620,7 @@ impl Engine {
                                           uids, np(&a.ucount), np(&a.members), h as i32, il as i32, p as i32, k as i32, nexp,
                                           arena.cb, arena.max_k2.max(6), arena.pool(6), arena.pool(7), suh2,
                                           cfg.moe_inter as i32, cfg.swiglu_limit, np(&a.pair), st);
+            } else if folded {
             } else if up_tiled && self.fat {
                 // the fat tile with the epilogue fused: xd straight into the pair buffer
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
@@ -3292,6 +3303,12 @@ impl Engine {
 fn tight_grid() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("TIDELM_TIGHT_GRID").as_deref() != Ok("0"))
+}
+
+/// rotkda lead 5: EXL3 expert input rotation folded into the fat gate/up tile (TIDELM_FAT_ROT=1), read once
+fn fat_rot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TIDELM_FAT_ROT").as_deref() == Ok("1"))
 }
 
 /// prefill-pg's opt-in e4m3 routed gate/up (TIDELM_FP8_GU=1), read once

@@ -1173,11 +1173,23 @@ __device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint32_t (&a)[4], 
 // distinct bank groups
 __device__ __forceinline__ int fat_swz(int row, int chunk) { return chunk ^ ((row >> 1) & 3); }
 
-template <int CB, int K2, int NS, int AX, int NB_STRIDE, bool F8 = false>
+template <typename T> __device__ __forceinline__ void ld4f(const T* p, float (&v)[4]);
+__device__ __forceinline__ void st4h(half* p, const float (&v)[4]);
+__device__ __forceinline__ void rot128_xs(float (&v)[4], const float (&x)[4], const float (&s)[4], int lane);
+
+// ROT (rotkda lead 5, TIDELM_FAT_ROT=1, gate / up only): the A rows are not staged from rot_in's X0 / X1
+// but rotated here, a 128-block of K (the 4 A stages) at a time, from the layer input XR (bf16 [rows]
+// [x_stride]) and the expert's input sides S0 / S1: rot_in4w's arithmetic per element (x * suh,
+// fwht128, * HAD_SCALE, fp16), so the same fp16 A operands; the rot_in pass and its P x K x 2 fp16
+// writes go away.
+template <int CB, int K2, int NS, int AX, int NB_STRIDE, bool F8 = false, bool ROT = false>
 __device__ __forceinline__ void fat_tiles(const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
                                           int NTILES, int KT, int nb0, const half* __restrict__ X0,
                                           const half* __restrict__ X1, int K, const int* rows_sh, int nmb, int warp,
-                                          int lane, unsigned char* smem, float (&acc)[NS][FAT_MB][2][4]) {
+                                          int lane, unsigned char* smem, float (&acc)[NS][FAT_MB][2][4],
+                                          const __nv_bfloat16* __restrict__ XR = nullptr, int x_stride = 0,
+                                          const half* __restrict__ S0 = nullptr, const half* __restrict__ S1 = nullptr,
+                                          int slots = 1) {
     constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
     constexpr int A_ROWS = FAT_MB * 16;
     if constexpr (F8) {
@@ -1284,10 +1296,11 @@ __device__ __forceinline__ void fat_tiles(const uint32_t* __restrict__ T0, const
     const LaneMap<K2> map(lane);
     const int tid = warp * 32 + lane;
     const int ktiles = KT / 2;                                  // 32-wide k stages
+    static_assert(!ROT || (AX == 2 && NS == 2 && NB_STRIDE == 0 && FAT_STAGES * FAT_TILE_K == 128), "ROT: gate / up, a 128-block = the ring");
     auto load_stage = [&](int stage, int kt) {
         half* sa = sh_a + stage * A_STAGE;
 #pragma unroll
-        for (int i = 0; i < A_CHUNKS / FAT_THREADS; ++i) {
+        for (int i = 0; i < (ROT ? 0 : A_CHUNKS / FAT_THREADS); ++i) {
             const int c = i * FAT_THREADS + tid;
             const int x = c / (A_ROWS * 4), rc = c % (A_ROWS * 4);
             const int row = rc >> 2, chunk = rc & 3;
@@ -1316,6 +1329,35 @@ __device__ __forceinline__ void fat_tiles(const uint32_t* __restrict__ T0, const
         const int nk = kt + FAT_STAGES - 1;
         if (nk < ktiles) load_stage(nk % FAT_STAGES, nk);
         cp_commit();
+        if constexpr (ROT) {
+            if ((kt & 3) == 0) {
+                // the 128-block kb of every live row, both matrices, into the 4 A stages (all warps are
+                // past the last block's stages: the barrier above)
+                const int kb = kt * FAT_TILE_K;
+                float s0v[4], s1v[4];
+                ld4f<half>(S0 + kb + 4 * lane, s0v);
+                ld4f<half>(S1 + kb + 4 * lane, s1v);
+                const int stg = lane >> 3, c = 4 * (lane & 7), ch = c >> 3, off = c & 7;
+#pragma unroll 2
+                for (int row = warp; row < nmb * 16; row += FAT_WARPS) {
+                    const int r = rows_sh[row];
+                    half* d0 = sh_a + stg * A_STAGE + row * FAT_TILE_K + fat_swz(row, ch) * 8 + off;
+                    half* d1 = d0 + A_ROWS * FAT_TILE_K;
+                    if (r < 0) {
+                        *reinterpret_cast<uint2*>(d0) = make_uint2(0u, 0u);
+                        *reinterpret_cast<uint2*>(d1) = make_uint2(0u, 0u);
+                        continue;
+                    }
+                    float xv[4], v[4], a[4];
+                    ld4f<__nv_bfloat16>(XR + (size_t)(r / slots) * x_stride + kb + 4 * lane, xv);
+                    rot128_xs(v, xv, s0v, lane);
+                    rot128_xs(a, xv, s1v, lane);
+                    st4h(d0, v);
+                    st4h(d1, a);
+                }
+                __syncthreads();
+            }
+        }
         const int stage = kt % FAT_STAGES;
         const half* sa = sh_a + stage * A_STAGE;
         const uint32_t* sb = sh_b + stage * B_STAGE;
@@ -1361,14 +1403,16 @@ __device__ __forceinline__ void fat_tiles(const uint32_t* __restrict__ T0, const
 // fp32 Z store - rotate, * svh, SwiGLU (act_mode 1), * suh_d (the caller's rank slice, stride
 // suh_d_stride), rotate, fp16 into xd [P][N] - bit for bit the two-kernel path's (the block's 128
 // columns are one Hadamard block, lane l holding columns 4l..4l+3 as there).
-template <int CB, int NS, int AX, int NB_STRIDE, int LO, int HI, bool EPI = false, bool F8 = false>
+template <int CB, int NS, int AX, int NB_STRIDE, int LO, int HI, bool EPI = false, bool F8 = false, bool ROT = false>
 __global__ void __launch_bounds__(FAT_THREADS, 2) prefill_fat_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int slots, const half* __restrict__ svh_g,
     const half* __restrict__ svh_u, const half* __restrict__ suh_d, int suh_d_stride, float limit,
-    half* __restrict__ xd, const float* __restrict__ xs0 = nullptr, const float* __restrict__ xs1 = nullptr) {
+    half* __restrict__ xd, const float* __restrict__ xs0 = nullptr, const float* __restrict__ xs1 = nullptr,
+    const __nv_bfloat16* __restrict__ XR = nullptr, int x_stride = 0, const half* __restrict__ SUH0 = nullptr,
+    const half* __restrict__ SUH1 = nullptr) {
     pdl_enter();
     constexpr int BM = FAT_MB * 16;
     extern __shared__ __align__(16) unsigned char fat_smem[];
@@ -1411,8 +1455,10 @@ __global__ void __launch_bounds__(FAT_THREADS, 2) prefill_fat_kernel(
 #define EXL3_FCASE(K2_)                                                                                         \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            fat_tiles<CB, K2_, NS, AX, NB_STRIDE, F8>(T0, T1, NTILES, KT, nb0, X0, X1, K, rows_sh, nmb, warp,    \
-                                                      lane, fat_smem, acc);                                     \
+            fat_tiles<CB, K2_, NS, AX, NB_STRIDE, F8, ROT>(T0, T1, NTILES, KT, nb0, X0, X1, K, rows_sh, nmb, warp, \
+                                                      lane, fat_smem, acc, XR, x_stride,                        \
+                                                      ROT ? SUH0 + (size_t)e * K : nullptr,                     \
+                                                      ROT ? SUH1 + (size_t)e * K : nullptr, slots);             \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -1522,7 +1568,7 @@ void prefill_fat_launch(const void* x0, const void* x1, const int64_t* tp0, cons
         dim3 grid((unsigned)(N / 128), (unsigned)nblocks, 1);
         pdl_launch(kernel, grid, FAT_THREADS, smem, stream, (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids,
                    ucount, members, z, K, N, P, slots, (const half*)nullptr, (const half*)nullptr, (const half*)nullptr, 0,
-                   0.f, (half*)nullptr, (const float*)nullptr, (const float*)nullptr);
+                   0.f, (half*)nullptr, (const float*)nullptr, (const float*)nullptr, (const __nv_bfloat16*)nullptr, 0, (const half*)nullptr, (const half*)nullptr);
     } else {
         EXL3_CHECK(N % 256 == 0, "fat prefill: N must be a multiple of 256 for one matrix");
         constexpr int smem = fat_smem_bytes<HI, 2, 1>();
@@ -1531,7 +1577,7 @@ void prefill_fat_launch(const void* x0, const void* x1, const int64_t* tp0, cons
         dim3 grid((unsigned)(N / 256), (unsigned)nblocks, 1);
         pdl_launch(kernel, grid, FAT_THREADS, smem, stream, (const half*)x0, (const half*)x0, tp0, tp0, k2_0, k2_0, uids,
                    ucount, members, z, K, N, P, slots, (const half*)nullptr, (const half*)nullptr, (const half*)nullptr, 0,
-                   0.f, (half*)nullptr, (const float*)nullptr, (const float*)nullptr);
+                   0.f, (half*)nullptr, (const float*)nullptr, (const float*)nullptr, (const __nv_bfloat16*)nullptr, 0, (const half*)nullptr, (const half*)nullptr);
     }
 }
 
@@ -1550,7 +1596,27 @@ void prefill_fat_gateup_launch(const void* x0, const void* x1, const int64_t* tp
     dim3 grid((unsigned)(N / 128), (unsigned)nblocks, 1);
     pdl_launch(kernel, grid, FAT_THREADS, smem, stream, (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids,
                ucount, members, (float*)nullptr, K, N, P, slots, (const half*)svh_g, (const half*)svh_u, (const half*)suh_d,
-               suh_d_stride, limit, (half*)xd, (const float*)nullptr, (const float*)nullptr);
+               suh_d_stride, limit, (half*)xd, (const float*)nullptr, (const float*)nullptr, (const __nv_bfloat16*)nullptr, 0, (const half*)nullptr, (const half*)nullptr);
+}
+
+// gate / up with the fused epilogue and the input rotation folded in (TIDELM_FAT_ROT, rotkda lead 5): x the
+// layer input (bf16 [rows][x_stride]), suh0 / suh1 the gate / up input sides [E][K]; no rot_in before it.
+template <int CB, int HI>
+void prefill_fat_gateup_rot_launch(const void* x, int x_stride, const void* suh0, const void* suh1, const int64_t* tp0,
+                                   const int64_t* tp1, const int* k2_0, const int* k2_1, const int* uids, const int* ucount,
+                                   const int* members, int K, int N, int P, int slots, int nblocks, const void* svh_g,
+                                   const void* svh_u, const void* suh_d, int suh_d_stride, float limit, void* xd,
+                                   cudaStream_t stream) {
+    EXL3_CHECK(K % 128 == 0 && N % 128 == 0, "fat prefill (rot): K a multiple of 128, N of 128");
+    static bool set = false;
+    constexpr int smem = fat_smem_bytes<HI, 2, 2>();
+    auto kernel = prefill_fat_kernel<CB, 2, 2, 0, 4, HI, true, false, true>;
+    if (!set) { cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); set = true; }
+    dim3 grid((unsigned)(N / 128), (unsigned)nblocks, 1);
+    pdl_launch(kernel, grid, FAT_THREADS, smem, stream, (const half*)nullptr, (const half*)nullptr, tp0, tp1, k2_0, k2_1,
+               uids, ucount, members, (float*)nullptr, K, N, P, slots, (const half*)svh_g, (const half*)svh_u,
+               (const half*)suh_d, suh_d_stride, limit, (half*)xd, (const float*)nullptr, (const float*)nullptr,
+               (const __nv_bfloat16*)x, x_stride, (const half*)suh0, (const half*)suh1);
 }
 
 // gate / up in e4m3 with the fused epilogue (TIDELM_FP8_GU): X0 / X1 e4m3 rows from rot_in8, xs0 / xs1
@@ -1570,7 +1636,7 @@ void prefill_fat_gateup8_launch(const void* x0, const void* x1, const float* xs0
     dim3 grid((unsigned)(N / 128), (unsigned)nblocks, 1);
     pdl_launch(kernel, grid, FAT_THREADS, smem, stream, (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids,
                ucount, members, (float*)nullptr, K, N, P, slots, (const half*)svh_g, (const half*)svh_u, (const half*)suh_d,
-               suh_d_stride, limit, (half*)xd, xs0, xs1);
+               suh_d_stride, limit, (half*)xd, xs0, xs1, (const __nv_bfloat16*)nullptr, 0, (const half*)nullptr, (const half*)nullptr);
 }
 
 // ---------------------------------------------------------------- rotations / epilogues (TensorFold experts.cu)
@@ -1586,6 +1652,24 @@ __device__ __forceinline__ float swiglu_act(float g, float u, float svg, float s
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
     v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
+            v[j] = (lane & m) ? o - v[j] : v[j] + o;
+        }
+    }
+}
+
+// fwht128 of x * s as rot_in4w's compiled code computes it (sm_121 SASS, nvcc 13: the first butterfly
+// contracts each x0 * s0 / x2 * s2 product into its add / sub, x1 * s1 / x3 * s3 rounded), written out
+// with _rn intrinsics so the fat tile's ROT path gets the same bits whatever the compiler does there
+__device__ __forceinline__ void rot128_xs(float (&v)[4], const float (&x)[4], const float (&s)[4], int lane) {
+    const float p1 = __fmul_rn(x[1], s[1]), p3 = __fmul_rn(x[3], s[3]);
+    const float a = __fmaf_rn(x[0], s[0], p1), b = __fmaf_rn(x[0], s[0], -p1);
+    const float c = __fmaf_rn(x[2], s[2], p3), d = __fmaf_rn(x[2], s[2], -p3);
+    v[0] = __fadd_rn(a, c); v[1] = __fadd_rn(b, d); v[2] = __fsub_rn(a, c); v[3] = __fsub_rn(b, d);
 #pragma unroll
     for (int m = 1; m < 32; m <<= 1) {
 #pragma unroll
@@ -2446,6 +2530,35 @@ void exl3m_prefill_fat_gateup(const void* X0, const void* X1, const int64_t* tp0
     else if (cb == 6 && hi <= 8) EXL3_FG(6, 8);
     else EXL3_CHECK(false, "fat prefill: codebook mul1, mcg or exlr8's, widths up to 4 bits");
 #undef EXL3_FG
+}
+
+// exl3m_prefill_fat_gateup with exl3m_rot_in folded in (TIDELM_FAT_ROT, rotkda): x / x_stride / suh0 / suh1
+// as exl3m_rot_in takes them (x bf16); xd bit for bit the rot_in + fat pair's. 0 when the shape / alignment
+// is not one it takes (the caller then runs the pair).
+int exl3m_prefill_fat_gateup_rot(const void* x, int x_stride, const void* suh0, const void* suh1, const int64_t* tp0,
+                                 const int64_t* tp1, const int* k2_0, const int* k2_1, const int* uids, const int* ucount,
+                                 const int* members, int K, int N, int P, int slots, int nblocks, int cb, int hi,
+                                 const void* svh_g, const void* svh_u, const void* suh_d, int suh_d_stride, float limit,
+                                 void* xd, cudaStream_t s) {
+    if (!(al8(x) && x_stride % 4 == 0 && al8(suh0) && al8(suh1) && K % 128 == 0)) return 0;
+#define EXL3_FGR(CB_, HI_) exl3::prefill_fat_gateup_rot_launch<CB_, HI_>(x, x_stride, suh0, suh1, tp0, tp1, k2_0, k2_1, uids, \
+                                                                        ucount, members, K, N, P, slots, nblocks, svh_g,   \
+                                                                        svh_u, suh_d, suh_d_stride, limit, xd, s)
+    if (cb == 1 && hi <= 6) EXL3_FGR(1, 6);
+    else if (cb == 1 && hi <= 8) EXL3_FGR(1, 8);
+    else if (cb == 2 && hi <= 6) EXL3_FGR(2, 6);
+    else if (cb == 2 && hi <= 8) EXL3_FGR(2, 8);
+    else if (cb == 3 && hi <= 6) EXL3_FGR(3, 6);
+    else if (cb == 3 && hi <= 8) EXL3_FGR(3, 8);
+    else if (cb == 4 && hi <= 6) EXL3_FGR(4, 6);
+    else if (cb == 4 && hi <= 8) EXL3_FGR(4, 8);
+    else if (cb == 5 && hi <= 6) EXL3_FGR(5, 6);
+    else if (cb == 5 && hi <= 8) EXL3_FGR(5, 8);
+    else if (cb == 6 && hi <= 6) EXL3_FGR(6, 6);
+    else if (cb == 6 && hi <= 8) EXL3_FGR(6, 8);
+    else return 0;
+#undef EXL3_FGR
+    return 1;
 }
 
 // exl3m_prefill_fat_gateup over rot_in8's e4m3 rows (TIDELM_FP8_GU, prefill-pg): not bit-exact.

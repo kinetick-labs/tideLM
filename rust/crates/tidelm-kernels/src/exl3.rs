@@ -98,6 +98,15 @@ extern "C" {
                                     members: *const c_void, k: c_int, n: c_int, p: c_int, slots: c_int, nblocks: c_int,
                                     cb: c_int, hi: c_int, svh_g: *const c_void, svh_u: *const c_void, suh_d: *const c_void,
                                     suh_d_stride: c_int, limit: f32, xd: *mut c_void, s: CudaStream);
+    /// exl3m_prefill_fat_gateup with exl3m_rot_in folded in (rotkda, TIDELM_FAT_ROT=1): `x` (bf16, stride
+    /// `x_stride`) and the gate / up input sides as exl3m_rot_in takes them; xd bit for bit the pair's.
+    /// Returns 0 (nothing launched) when the shape or alignment is not one it takes.
+    pub fn exl3m_prefill_fat_gateup_rot(x: *const c_void, x_stride: c_int, suh0: *const c_void, suh1: *const c_void,
+                                        tp0: *const c_void, tp1: *const c_void, k2_0: *const c_void, k2_1: *const c_void,
+                                        uids: *const c_void, ucount: *const c_void, members: *const c_void, k: c_int,
+                                        n: c_int, p: c_int, slots: c_int, nblocks: c_int, cb: c_int, hi: c_int,
+                                        svh_g: *const c_void, svh_u: *const c_void, suh_d: *const c_void,
+                                        suh_d_stride: c_int, limit: f32, xd: *mut c_void, s: CudaStream) -> c_int;
     /// prefill-pg's FP8 gate/up (TIDELM_FP8_GU): rot_in's rows as e4m3 (row scales after them, at byte p * k)
     pub fn exl3m_rot_in8(x: *const c_void, x_stride: c_int, pick: *const c_void, suh0: *const c_void, suh1: *const c_void,
                          out0: *mut c_void, out1: *mut c_void, rows: c_int, k: c_int, slots: c_int, x_bf16: c_int,

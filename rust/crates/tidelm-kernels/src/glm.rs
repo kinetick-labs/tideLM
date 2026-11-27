@@ -94,6 +94,13 @@ extern "C" {
                         resident: *const c_void, hot: *mut c_void, ex_ids: *const c_void, ex_w: *const c_void,
                         demand: *mut c_void, acc: *mut c_void, live: *const c_void, lane_acc: *mut c_void,
                         lane_demand: *mut c_void, lane_stride: i64, row_lane: *const c_void, e: c_int) -> c_int;
+    pub fn glm_router_skip(stream: CudaStream, logits: *const c_void, bias: *const c_void, allowed: *const c_void,
+                           lut: *const c_void, t: c_int, k: c_int, scale: f32, ids: *mut c_void, w: *mut c_void,
+                           resident: *const c_void, hot: *mut c_void, ex_ids: *const c_void, ex_w: *const c_void,
+                           demand: *mut c_void, acc: *mut c_void, live: *const c_void, lane_acc: *mut c_void,
+                           lane_demand: *mut c_void, lane_stride: i64, row_lane: *const c_void, e: c_int, skip: f32,
+                           skip_acc: *mut c_void) -> c_int;
+    pub fn glm_skip_counters(dev: *mut *mut c_void, host: *mut *mut c_void) -> c_int;
     pub fn glm_quant_kvb_bf16(stream: CudaStream, w: *const c_void, rows: c_int, q: *mut c_void, s_rows: *mut c_void) -> c_int;
     pub fn glm_quant_int8_rows(stream: CudaStream, x: *const c_void, rows: c_int, h: c_int, q: *mut c_void,
                                s: *mut c_void) -> c_int;

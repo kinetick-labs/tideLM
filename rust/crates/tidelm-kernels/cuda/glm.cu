@@ -2450,7 +2450,10 @@ int glm_skip_counters(void** dev, void** host) {
         if (e != cudaSuccess) return (int)e;
         int dev_id = 0;
         cudaGetDevice(&dev_id);
-        cudaMemAdvise(d, 4 * sizeof(unsigned long long), cudaMemAdviseSetPreferredLocation, dev_id);
+        cudaMemLocation loc{};
+        loc.type = cudaMemLocationTypeDevice;
+        loc.id = dev_id;
+        cudaMemAdvise(d, 4 * sizeof(unsigned long long), cudaMemAdviseSetPreferredLocation, loc);
         cudaMemset(d, 0, 4 * sizeof(unsigned long long));
         cudaDeviceSynchronize();
     }

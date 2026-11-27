@@ -2439,18 +2439,22 @@ int glm_router_e(void* stream, const void* logits, const void* bias, const void*
                            live, lane_acc, lane_demand, lane_stride, row_lane, E, 0.f, nullptr);
 }
 
-// expert-skip's counters: 4 u64 in mapped pinned memory (decode valid, kept; prefill valid, kept), the
-// device pointer for the kernels and the host one for the request log; allocated on the first call
+// expert-skip's counters: 4 u64 (decode valid, kept; prefill valid, kept) in managed memory kept on the
+// device, so the routers' atomics are L2 atomics (in mapped pinned memory each was a system-scope atomic
+// over C2C, ~0.25 s of a 8K prefill); the host reads them through the coherent mapping (GB10). Allocated
+// on the first call; dev == host.
 int glm_skip_counters(void** dev, void** host) {
-    static void* h = nullptr;
     static void* d = nullptr;
-    if (!h) {
-        cudaError_t e = cudaHostAlloc(&h, 4 * sizeof(unsigned long long), cudaHostAllocMapped);
+    if (!d) {
+        cudaError_t e = cudaMallocManaged(&d, 4 * sizeof(unsigned long long), cudaMemAttachGlobal);
         if (e != cudaSuccess) return (int)e;
-        memset(h, 0, 4 * sizeof(unsigned long long));
-        e = cudaHostGetDevicePointer(&d, h, 0);
-        if (e != cudaSuccess) return (int)e;
+        int dev_id = 0;
+        cudaGetDevice(&dev_id);
+        cudaMemAdvise(d, 4 * sizeof(unsigned long long), cudaMemAdviseSetPreferredLocation, dev_id);
+        cudaMemset(d, 0, 4 * sizeof(unsigned long long));
+        cudaDeviceSynchronize();
     }
+    void* h = d;
     *dev = d;
     *host = h;
     return 0;

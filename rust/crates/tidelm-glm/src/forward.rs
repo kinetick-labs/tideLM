@@ -570,6 +570,10 @@ impl Engine {
         // decode attention's split partials in fp16 (glm.cu c_mla_half; bench_mla: mla + combine at
         // 1 / 4 / 8 rows 47.5 / 136.9 / 211.7 -> 44.3 / 116.0 / 188.2 us); TIDELM_GLM_MLA_HALF=0 keeps fp32
         let mla_half = (std::env::var("TIDELM_GLM_MLA_HALF").as_deref() != Ok("0")) as i32;
+        // expert-skip's counters allocated here, never inside a graph capture
+        if expert_skip(false, true) > 0.0 || expert_skip(false, false) > 0.0 {
+            let _ = skip_counter_ptrs();
+        }
         unsafe {
             glm_set_mla_half(mla_half);
             glm_set_pdl(pdl);
